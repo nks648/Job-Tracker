@@ -2,6 +2,8 @@
 Job Tracker - Checks company career pages daily for new postings.
 Filters for: Project Manager / Program Manager (Senior or Mid-level)
 Locations:   Munich area  |  Nuremberg area
+Logs all findings to jobs_database.csv
+Sends alerts to multiple recipients
 """
 
 import os
@@ -9,11 +11,14 @@ import json
 import re
 import hashlib
 import smtplib
+import csv
 import logging
 from datetime import datetime
 from urllib.parse import urlparse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FILTER CONFIG  ←  edit these to customise what you track
+# FILTER CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 ROLE_KEYWORDS = [
@@ -31,23 +36,18 @@ ROLE_KEYWORDS = [
     "projektmanager", "projektleiter", "programm manager",
 ]
 
-# Must NOT appear in title (junior / intern roles)
 SENIORITY_EXCLUDE = [
     "junior", "jr.", "jr ", "intern", "internship",
     "werkstudent", "praktikum", "praktikant",
     "entry level", "entry-level", "graduate", "trainee", "assistant",
 ]
 
-# Munich & Nuremberg surroundings
 LOCATION_KEYWORDS = [
-    # Munich area
     "munich", "münchen", "munchen", "taufkirchen", "ottobrunn",
     "garching", "unterschleißheim", "unterschleissheim",
     "oberpfaffenhofen", "dachau", "freising", "starnberg", "germering",
-    # Nuremberg area
     "nuremberg", "nürnberg", "nurnberg", "erlangen",
     "fürth", "furth", "schwabach", "herzogenaurach",
-    # Broad fallbacks
     "remote", "hybrid", "germany", "deutschland", "bavaria", "bayern",
 ]
 
@@ -96,8 +96,13 @@ COMPANIES = [
 # ── Config ─────────────────────────────────────────────────────────────────────
 GMAIL_USER     = os.environ["GMAIL_USER"]
 GMAIL_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", GMAIL_USER)
+# Multiple recipients: comma-separated in the secret
+# e.g. "nagarjun@gmail.com,friend@gmail.com"
+NOTIFY_EMAILS  = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
 STATE_FILE     = os.environ.get("STATE_FILE", "job_state.json")
+DB_FILE        = "jobs_database.csv"
+
+DB_COLUMNS = ["Date Recorded", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
 HEADERS = {
     "User-Agent": (
@@ -117,10 +122,9 @@ def contains_any(text, keywords):
     return any(ci(kw) in t for kw in keywords)
 
 def is_relevant_role(title):
-    t = ci(title)
-    if not contains_any(t, ROLE_KEYWORDS):
+    if not contains_any(title, ROLE_KEYWORDS):
         return False
-    if contains_any(t, SENIORITY_EXCLUDE):
+    if contains_any(title, SENIORITY_EXCLUDE):
         return False
     return True
 
@@ -135,6 +139,50 @@ def extract_location_hint(text):
             return m.group(0).strip()[:60]
     return None
 
+# ── CSV Database ───────────────────────────────────────────────────────────────
+
+def init_db():
+    """Create CSV with headers if it doesn't exist."""
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
+            writer.writeheader()
+        log.info("Created new jobs_database.csv")
+
+def load_db():
+    """Load existing records as a set of (company, title) tuples to avoid duplicates."""
+    existing = set()
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing.add((row["Company"].lower(), row["Job Title"].lower()))
+    return existing
+
+def append_to_db(records):
+    """Append new job records to the CSV database."""
+    if not records:
+        return
+    with open(DB_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
+        for r in records:
+            writer.writerow(r)
+    log.info("Appended %d new record(s) to jobs_database.csv", len(records))
+
+def append_page_change_to_db(company, career_url):
+    """Log a page change (JS-rendered, manual check needed)."""
+    with open(DB_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
+        writer.writerow({
+            "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+            "Company":       company,
+            "Job Title":     "⚠️ Page changed — check manually",
+            "Location":      "Unknown (JS-rendered)",
+            "Job URL":       career_url,
+            "Career Page":   career_url,
+            "Status":        "Needs Manual Check",
+        })
+
 # ── Job extraction ─────────────────────────────────────────────────────────────
 
 def extract_jobs(html, page_url):
@@ -143,44 +191,32 @@ def extract_jobs(html, page_url):
     base = urlparse(page_url)
 
     def abs_url(href):
-        if not href:
-            return page_url
-        if href.startswith("http"):
-            return href
-        if href.startswith("/"):
-            return f"{base.scheme}://{base.netloc}{href}"
+        if not href: return page_url
+        if href.startswith("http"): return href
+        if href.startswith("/"): return f"{base.scheme}://{base.netloc}{href}"
         return page_url
 
-    # Strategy 1: anchor tags whose text matches a role
     for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
-        if not (5 < len(title) < 160):
-            continue
-        if not is_relevant_role(title):
-            continue
+        if not (5 < len(title) < 160): continue
+        if not is_relevant_role(title): continue
         parent = a.find_parent()
         ctx = parent.get_text(" ", strip=True) if parent else ""
         location = extract_location_hint(ctx) or "See posting"
-        # Skip if we can clearly read a non-matching location
-        if location != "See posting" and not is_relevant_location(location):
-            continue
+        if location != "See posting" and not is_relevant_location(location): continue
         jobs.append({"title": title, "location": location, "url": abs_url(a["href"])})
 
-    # Strategy 2: text blocks (li / div / article) that match role + location
     if not jobs:
         for tag in soup.find_all(["li", "div", "article"]):
             text = tag.get_text(" ", strip=True)
-            if not is_relevant_role(text[:200]):
-                continue
-            if not is_relevant_location(text):
-                continue
+            if not is_relevant_role(text[:200]): continue
+            if not is_relevant_location(text): continue
             inner = tag.find("a", href=True)
             title_text = inner.get_text(strip=True) if inner else text[:100]
             location   = extract_location_hint(text) or "See posting"
             jobs.append({"title": title_text, "location": location,
                          "url": abs_url(inner["href"] if inner else None)})
 
-    # Deduplicate
     seen, unique = set(), []
     for j in jobs:
         key = ci(j["title"])
@@ -219,7 +255,7 @@ def page_fingerprint(html):
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 
-def send_email(results):
+def send_email(results, db_updated):
     total_jobs   = sum(len(r["new_jobs"]) for r in results)
     page_changes = sum(1 for r in results if r["page_changed"] and not r["new_jobs"])
     date_str     = datetime.today().strftime("%d %b %Y")
@@ -257,6 +293,14 @@ def send_email(results):
                 f"</tr>"
             )
 
+    db_note = (
+        "<p style='background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;"
+        "padding:10px 14px;font-size:13px;color:#166534;margin-top:24px'>"
+        "📊 <strong>jobs_database.csv</strong> has been updated with today's findings. "
+        "Check your GitHub repo's Actions artifacts to download the latest version."
+        "</p>"
+    ) if db_updated else ""
+
     html = f"""<html><body style="font-family:'Segoe UI',Arial,sans-serif;color:#111;max-width:720px;margin:auto;padding:24px">
   <div style="background:linear-gradient(135deg,#1d4ed8,#1e40af);border-radius:10px;padding:22px 28px;margin-bottom:28px">
     <h2 style="color:#fff;margin:0 0 6px">🚨 Job Alert — {date_str}</h2>
@@ -270,8 +314,10 @@ def send_email(results):
 
   {"<h3 style='color:#f59e0b;margin:28px 0 6px'>⚠️ Pages Changed — Manual Check Needed</h3><p style='color:#6b7280;font-size:13px;margin:0 0 10px'>These pages updated but jobs couldn't be auto-extracted (JS-rendered sites).</p><table style='border-collapse:collapse;width:100%'><tbody>" + page_rows + "</tbody></table>" if page_rows else ""}
 
+  {db_note}
+
   <p style="margin-top:32px;font-size:12px;color:#9ca3af;border-top:1px solid #f3f4f6;padding-top:16px">
-    Sent by your GitHub Actions Job Tracker · 
+    Sent by your GitHub Actions Job Tracker ·
     Edit <code>ROLE_KEYWORDS</code> / <code>LOCATION_KEYWORDS</code> in <code>checker.py</code> to adjust filters.
   </p>
 </body></html>"""
@@ -287,24 +333,42 @@ def send_email(results):
             lines.append(f"PAGE CHANGED: {r['company']} — {r['company_url']}")
     plain = "\n".join(lines)
 
-    msg = MIMEMultipart("alternative")
+    # Build message
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
-    msg["To"]      = NOTIFY_EMAIL
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html, "html"))
+    msg["To"]      = ", ".join(NOTIFY_EMAILS)   # ← multiple recipients
+
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(plain, "plain"))
+    body.attach(MIMEText(html, "html"))
+    msg.attach(body)
+
+    # Attach the CSV database
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition",
+                            f"attachment; filename=jobs_database_{datetime.today().strftime('%Y%m%d')}.csv")
+            msg.attach(part)
+        log.info("Attached jobs_database.csv to email")
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_PASSWORD)
-        s.sendmail(GMAIL_USER, NOTIFY_EMAIL, msg.as_string())
-    log.info("✉  Email sent to %s", NOTIFY_EMAIL)
+        s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
+    log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("── Job Tracker starting %s ──", datetime.now().isoformat())
-    state   = load_state()
-    results = []
+    init_db()
+    existing_db = load_db()
+    state       = load_state()
+    results     = []
+    new_db_rows = []
 
     for company in COMPANIES:
         name, url = company["name"], company["url"]
@@ -324,6 +388,25 @@ def main():
         new_jobs = [j for j in found if ci(j["title"]) not in known]
         log.info("  → %d matching / %d new", len(found), len(new_jobs))
 
+        # Save new jobs to DB
+        for j in new_jobs:
+            db_key = (name.lower(), ci(j["title"]))
+            if db_key not in existing_db:
+                new_db_rows.append({
+                    "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+                    "Company":       name,
+                    "Job Title":     j["title"],
+                    "Location":      j["location"],
+                    "Job URL":       j["url"],
+                    "Career Page":   url,
+                    "Status":        "New",
+                })
+                existing_db.add(db_key)
+
+        # Log page changes with no parseable jobs
+        if not first_run and changed and not new_jobs:
+            append_page_change_to_db(name, url)
+
         if first_run:
             log.info("  → First run: baseline saved")
         elif new_jobs:
@@ -342,11 +425,15 @@ def main():
                 "page_changed": changed,
             })
 
+    # Write new rows to CSV
+    if new_db_rows:
+        append_to_db(new_db_rows)
+
     save_state(state)
 
     if results:
-        log.info("Sending email…")
-        send_email(results)
+        log.info("Sending email to %d recipient(s)…", len(NOTIFY_EMAILS))
+        send_email(results, db_updated=bool(new_db_rows))
     else:
         log.info("No new matching roles today.")
 
