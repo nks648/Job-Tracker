@@ -12,8 +12,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -32,6 +30,14 @@ jobs:
           restore-keys: |
             job-state-
 
+      - name: Restore jobs database
+        uses: actions/cache@v4
+        with:
+          path: jobs_database.csv
+          key: jobs-db-${{ github.run_id }}
+          restore-keys: |
+            jobs-db-
+
       - name: Run job checker
         env:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
@@ -45,3 +51,16 @@ jobs:
         with:
           path: job_state.json
           key: job-state-${{ github.run_id }}
+
+      - name: Save updated jobs database
+        uses: actions/cache@v4
+        with:
+          path: jobs_database.csv
+          key: jobs-db-${{ github.run_id }}
+
+      - name: Upload database as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-database-${{ github.run_number }}
+          path: jobs_database.csv
+          retention-days: 90
