@@ -23,6 +23,12 @@ from email import encoders
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    import anthropic as _anthropic_module
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -94,13 +100,15 @@ COMPANIES = [
 ]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-GMAIL_USER     = os.environ["GMAIL_USER"]
-GMAIL_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+GMAIL_USER        = os.environ["GMAIL_USER"]
+GMAIL_PASSWORD    = os.environ["GMAIL_APP_PASSWORD"]
 # Multiple recipients: comma-separated in the secret
 # e.g. "nagarjun@gmail.com,friend@gmail.com"
-NOTIFY_EMAILS  = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
-STATE_FILE     = os.environ.get("STATE_FILE", "job_state.json")
-DB_FILE        = "jobs_database.csv"
+NOTIFY_EMAILS     = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
+STATE_FILE        = os.environ.get("STATE_FILE", "job_state.json")
+DB_FILE           = "jobs_database.csv"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_ENABLED        = _ANTHROPIC_AVAILABLE and bool(ANTHROPIC_API_KEY)
 
 DB_COLUMNS = ["Date Recorded", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
@@ -253,6 +261,96 @@ def page_fingerprint(html):
     text = " ".join(soup.get_text(" ", strip=True).split())
     return hashlib.sha256(text.encode()).hexdigest()
 
+# ── AI Helpers ─────────────────────────────────────────────────────────────────
+
+def get_page_text(html):
+    """Strip boilerplate tags and return clean page text for AI consumption."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+        tag.decompose()
+    return " ".join(soup.get_text(" ", strip=True).split())
+
+
+def ai_validate_jobs(jobs, company_name):
+    """Use Claude to contextually filter keyword-matched jobs, removing false positives
+    and surfacing semantic variants the keyword list might miss."""
+    if not jobs:
+        return jobs
+
+    client = _anthropic_module.Anthropic(api_key=ANTHROPIC_API_KEY)
+    titles = [j["title"] for j in jobs]
+
+    prompt = (
+        f"You are filtering job listings for someone seeking Senior or Mid-level "
+        f"Project Manager / Program Manager roles in Munich or Nuremberg, Germany.\n\n"
+        f"Company: {company_name}\n"
+        f"Evaluate the following job titles. Return ONLY a JSON array of 0-based indices "
+        f"for titles that are genuinely relevant:\n"
+        f"- KEEP: Senior/Mid PM, Program Manager, IT Project Manager, Technical Project Manager, "
+        f"PMO Lead, Delivery Manager, Projektmanager, Projektleiter, and close semantic equivalents.\n"
+        f"- DROP: Junior/Intern/Trainee/Graduate, pure engineering roles that incidentally mention "
+        f"'project', administrative or coordinator roles far below PM level.\n\n"
+        f"Titles:\n{json.dumps(titles, indent=2)}\n\n"
+        f"Return only the JSON array of indices to keep, e.g. [0, 2]. No explanation."
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        keep = json.loads(response.content[0].text.strip())
+        if isinstance(keep, list):
+            filtered = [jobs[i] for i in keep if isinstance(i, int) and i < len(jobs)]
+            log.info("  🤖 AI validation: %d → %d job(s)", len(jobs), len(filtered))
+            return filtered
+    except Exception as exc:
+        log.warning("  ⚠  AI validation failed (%s), keeping keyword results", exc)
+    return jobs
+
+
+def ai_extract_jobs(text, page_url, company_name):
+    """Use Claude to extract relevant jobs from raw page text.
+    Primary use: JS-rendered pages that the HTML parser couldn't parse."""
+    client = _anthropic_module.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    prompt = (
+        f"You are analyzing a career page for job listings.\n\n"
+        f"Company: {company_name}\nPage URL: {page_url}\n\n"
+        f"Page text (first 3000 chars):\n{text[:3000]}\n\n"
+        f"Extract job listings that meet ALL of these criteria:\n"
+        f"1. Role: Project Manager, Program Manager, or a close equivalent "
+        f"(e.g. Delivery Manager, PMO, IT Project Lead, Projektleiter, Scrum Master if PM-adjacent).\n"
+        f"2. Seniority: NOT junior / intern / trainee / graduate.\n"
+        f"3. Location: Munich, Nuremberg, Bavaria, Germany, Remote, or Hybrid.\n\n"
+        f"Return a JSON array of objects with keys: title (string), location (string), url (string).\n"
+        f"If a direct job URL is not visible in the text, set url to an empty string.\n"
+        f"If no relevant jobs are found, return [].\n"
+        f"Return ONLY the JSON array, no explanation."
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        extracted = json.loads(response.content[0].text.strip())
+        if isinstance(extracted, list):
+            # Fill missing url with the career page url
+            for j in extracted:
+                if not j.get("url"):
+                    j["url"] = page_url
+                if not j.get("location"):
+                    j["location"] = "See posting"
+            log.info("  🤖 AI extraction: found %d job(s) from page text", len(extracted))
+            return extracted
+    except Exception as exc:
+        log.warning("  ⚠  AI extraction failed (%s)", exc)
+    return []
+
+
 # ── Email ──────────────────────────────────────────────────────────────────────
 
 def send_email(results, db_updated):
@@ -364,6 +462,7 @@ def send_email(results, db_updated):
 
 def main():
     log.info("── Job Tracker starting %s ──", datetime.now().isoformat())
+    log.info("AI contextual search: %s", "enabled" if AI_ENABLED else "disabled (set ANTHROPIC_API_KEY to enable)")
     init_db()
     existing_db = load_db()
     state       = load_state()
@@ -384,7 +483,16 @@ def main():
         first_run = old_fp is None
         changed   = (not first_run) and (fp != old_fp)
 
-        found    = extract_jobs(html, url)
+        found = extract_jobs(html, url)
+
+        # AI layer 1: contextually validate keyword-matched jobs
+        if AI_ENABLED and found:
+            found = ai_validate_jobs(found, name)
+
+        # AI layer 2: fallback extraction for JS-heavy pages keyword matching missed
+        if AI_ENABLED and not found and not first_run and changed:
+            found = ai_extract_jobs(get_page_text(html), url, name)
+
         new_jobs = [j for j in found if ci(j["title"]) not in known]
         log.info("  → %d matching / %d new", len(found), len(new_jobs))
 
