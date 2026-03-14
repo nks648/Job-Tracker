@@ -180,12 +180,18 @@ def _relative_to_date(text):
     # "1 hour ago", "2 hours ago" → still today
     if re.search(r'\d+\s*(?:hour|stunde|minute|min)\b', t):
         return today
-    # "2 days ago", "vor 2 Tagen"
+    # "2 days ago" / "vor 2 Tagen" / "vor 2 Tage"
     m = re.search(r'(\d+)\s*(?:day|tag)\b', t)
     if m:
         n = int(m.group(1))
         if n <= 30:
             return today - timedelta(days=n)
+    # "1 week ago" / "vor 1 Woche"
+    m = re.search(r'(\d+)\s*(?:week|woche)\b', t)
+    if m:
+        n = int(m.group(1))
+        if n <= 4:
+            return today - timedelta(weeks=n)
     return None
 
 
@@ -227,10 +233,10 @@ def _tag_date(tag):
         d = _parse_date_str(time_el["datetime"])
         if d:
             return d
-    # 2. <meta itemprop="datePosted" content="2026-03-14">
-    meta = tag.find("meta", attrs={"itemprop": "datePosted"})
-    if meta and meta.get("content"):
-        d = _parse_date_str(meta["content"])
+    # 2. <meta itemprop="datePosted" content="2026-03-14">  or  <span itemprop="datePosted">
+    for el in tag.find_all(attrs={"itemprop": "datePosted"}):
+        val = el.get("content") or el.get_text(strip=True)
+        d = _parse_date_str(val)
         if d:
             return d
     # 3. data-date / data-posted / data-dateposted attributes anywhere in the container
@@ -393,6 +399,83 @@ def fetch_lever_jobs(career_url):
 
     fp = json.dumps(sorted(j.get("id", "") for j in postings))
     log.info("  📡 Lever API: %d total / %d matching", len(postings), len(jobs))
+    return fp, jobs
+
+
+def fetch_workday_jobs(career_url):
+    """Use the unofficial Workday CXS POST API to get jobs with real postedOn dates.
+    Company slug = subdomain; site = first path segment of the career URL."""
+    parsed     = urlparse(career_url)
+    company    = parsed.hostname.split(".")[0]          # e.g. "ag" or "arianegroup"
+    site       = parsed.path.strip("/").split("/")[0]   # e.g. "Airbus" or "EXTERNALALL"
+    # Strip locale prefix if present (e.g. "fr-FR/EXTERNALALL" → "EXTERNALALL")
+    if re.match(r'^[a-z]{2}-[A-Z]{2}$', site):
+        parts = parsed.path.strip("/").split("/")
+        site = parts[1] if len(parts) > 1 else site
+    api_url = f"https://{parsed.hostname}/wday/cxs/{company}/{site}/jobs"
+    try:
+        resp = requests.post(api_url, json={"appliedFacets": {}, "limit": 100, "offset": 0,
+                                            "searchText": ""},
+                             headers={**HEADERS, "Content-Type": "application/json"}, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Workday CXS API error (%s): %s", career_url, exc)
+        return None, []
+
+    jobs = []
+    for j in data.get("jobPostings", []):
+        title    = j.get("title", "")
+        location = j.get("locationsText", "See posting")
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        ext_path = j.get("externalPath", "")
+        job_url  = f"https://{parsed.hostname}{ext_path}" if ext_path else career_url
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         job_url,
+            "date_posted": _parse_date_str(j.get("postedOn", "")),
+        })
+
+    all_postings = data.get("jobPostings", [])
+    fp = json.dumps(sorted(j.get("title", "") + j.get("postedOn", "") for j in all_postings))
+    log.info("  📡 Workday CXS API: %d total / %d matching", len(all_postings), len(jobs))
+    return fp, jobs
+
+
+def fetch_recruitee_jobs(career_url):
+    """Use the Recruitee public offers API. Company slug = subdomain."""
+    company = urlparse(career_url).hostname.split(".")[0]
+    api_url = f"https://{company}.recruitee.com/api/offers/"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Recruitee API error (%s): %s", career_url, exc)
+        return None, []
+
+    jobs = []
+    for j in data.get("offers", []):
+        title    = j.get("title", "")
+        location = j.get("location", "") or j.get("city", "") or "See posting"
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         j.get("careers_url", career_url),
+            "date_posted": _parse_date_str(j.get("created_at", "") or j.get("published_at", "")),
+        })
+
+    all_offers = data.get("offers", [])
+    fp = json.dumps(sorted(str(j.get("id", "")) for j in all_offers))
+    log.info("  📡 Recruitee API: %d total / %d matching", len(all_offers), len(jobs))
     return fp, jobs
 
 
@@ -694,6 +777,10 @@ def main():
             fp_source, found = fetch_greenhouse_jobs(url)
         elif "lever.co" in url:
             fp_source, found = fetch_lever_jobs(url)
+        elif "myworkdayjobs.com" in url:
+            fp_source, found = fetch_workday_jobs(url)
+        elif "recruitee.com" in url:
+            fp_source, found = fetch_recruitee_jobs(url)
         else:
             html = fetch(url)
             if not html:
