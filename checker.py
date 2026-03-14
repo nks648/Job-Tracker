@@ -13,7 +13,7 @@ import hashlib
 import smtplib
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -110,7 +110,7 @@ DB_FILE           = "jobs_database.csv"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_ENABLED     = _GEMINI_AVAILABLE and bool(GEMINI_API_KEY)
 
-DB_COLUMNS = ["Date Recorded", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
+DB_COLUMNS = ["Date Recorded", "Date Posted", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
 HEADERS = {
     "User-Agent": (
@@ -146,6 +146,95 @@ def extract_location_hint(text):
         if m:
             return m.group(0).strip()[:60]
     return None
+
+# ── Date helpers ───────────────────────────────────────────────────────────────
+
+def _parse_date_str(s):
+    """Parse ISO (2026-03-14, 2026-03-14T...) or European (14.03.2026) date strings."""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    m = re.match(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', s)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def _relative_to_date(text):
+    """Parse relative date text: 'today', 'yesterday', 'X days ago', 'heute', 'gestern'."""
+    t = text.lower()
+    today = date.today()
+    if any(w in t for w in ("today", "heute", "just posted", "new today")):
+        return today
+    if any(w in t for w in ("yesterday", "gestern")):
+        return today - timedelta(days=1)
+    # "1 hour ago", "2 hours ago" → still today
+    if re.search(r'\d+\s*(?:hour|stunde|minute|min)\b', t):
+        return today
+    # "2 days ago", "vor 2 Tagen"
+    m = re.search(r'(\d+)\s*(?:day|tag)\b', t)
+    if m:
+        n = int(m.group(1))
+        if n <= 30:
+            return today - timedelta(days=n)
+    return None
+
+
+def _parse_jsonld_dates(html):
+    """Return {url: date, title_lower: date} from JSON-LD JobPosting blocks.
+    Used by Greenhouse, Lever, Recruitee, and most modern job boards."""
+    soup = BeautifulSoup(html, "html.parser")
+    dates = {}
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("@type") not in ("JobPosting", "jobPosting"):
+                    continue
+                d = _parse_date_str(item.get("datePosted", ""))
+                if not d:
+                    continue
+                url   = item.get("url", "")
+                title = (item.get("title") or item.get("name") or "").strip()
+                if url:
+                    dates[url] = d
+                if title:
+                    dates[title.lower()] = d
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return dates
+
+
+def _tag_date(tag):
+    """Search a BeautifulSoup tag for a date: time[datetime] element or relative text."""
+    if tag is None:
+        return None
+    time_el = tag.find("time", attrs={"datetime": True})
+    if time_el:
+        d = _parse_date_str(time_el["datetime"])
+        if d:
+            return d
+    return _relative_to_date(tag.get_text(" ", strip=True))
+
+
+def is_recent(d):
+    """True if posting date is today, yesterday, or unknown (None → include, never miss a job)."""
+    if d is None:
+        return True
+    return d >= date.today() - timedelta(days=1)
+
 
 # ── CSV Database ───────────────────────────────────────────────────────────────
 
@@ -183,6 +272,7 @@ def append_page_change_to_db(company, career_url):
         writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
         writer.writerow({
             "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+            "Date Posted":   "",
             "Company":       company,
             "Job Title":     "⚠️ Page changed — check manually",
             "Location":      "Unknown (JS-rendered)",
@@ -197,12 +287,19 @@ def extract_jobs(html, page_url):
     soup = BeautifulSoup(html, "html.parser")
     jobs = []
     base = urlparse(page_url)
+    jsonld_dates = _parse_jsonld_dates(html)  # {url/title_lower: date} from JSON-LD
 
     def abs_url(href):
         if not href: return page_url
         if href.startswith("http"): return href
         if href.startswith("/"): return f"{base.scheme}://{base.netloc}{href}"
         return page_url
+
+    def resolve_date(job_url, title, container):
+        """Date lookup: JSON-LD by URL → JSON-LD by title → HTML time tag → relative text."""
+        return (jsonld_dates.get(job_url)
+                or jsonld_dates.get(title.lower())
+                or _tag_date(container))
 
     for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
@@ -212,7 +309,9 @@ def extract_jobs(html, page_url):
         ctx = parent.get_text(" ", strip=True) if parent else ""
         location = extract_location_hint(ctx) or "See posting"
         if location != "See posting" and not is_relevant_location(location): continue
-        jobs.append({"title": title, "location": location, "url": abs_url(a["href"])})
+        job_url = abs_url(a["href"])
+        jobs.append({"title": title, "location": location, "url": job_url,
+                     "date_posted": resolve_date(job_url, title, parent)})
 
     if not jobs:
         for tag in soup.find_all(["li", "div", "article"]):
@@ -222,8 +321,9 @@ def extract_jobs(html, page_url):
             inner = tag.find("a", href=True)
             title_text = inner.get_text(strip=True) if inner else text[:100]
             location   = extract_location_hint(text) or "See posting"
-            jobs.append({"title": title_text, "location": location,
-                         "url": abs_url(inner["href"] if inner else None)})
+            job_url    = abs_url(inner["href"] if inner else None)
+            jobs.append({"title": title_text, "location": location, "url": job_url,
+                         "date_posted": resolve_date(job_url, title_text, tag)})
 
     seen, unique = set(), []
     for j in jobs:
@@ -363,11 +463,13 @@ def send_email(results, db_updated):
     job_rows = ""
     for r in results:
         for j in r["new_jobs"]:
+            posted = j["date_posted"].strftime("%d %b") if j.get("date_posted") else "—"
             job_rows += (
                 f"<tr style='border-bottom:1px solid #f3f4f6'>"
                 f"<td style='padding:12px 14px 12px 0;font-weight:600;font-size:14px'>{r['company']}</td>"
                 f"<td style='padding:12px 14px 12px 0;font-size:14px'>{j['title']}</td>"
                 f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>{j['location']}</td>"
+                f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>{posted}</td>"
                 f"<td style='padding:12px 0'>"
                 f"<a href='{j['url']}' style='background:#2563eb;color:#fff;padding:5px 14px;"
                 f"border-radius:5px;text-decoration:none;font-size:13px;font-weight:600'>Apply →</a>"
@@ -403,7 +505,7 @@ def send_email(results, db_updated):
     </p>
   </div>
 
-  {"<h3 style='color:#1d4ed8;margin:0 0 10px'>✅ " + str(total_jobs) + " New Matching Role(s)</h3><table style='border-collapse:collapse;width:100%'><thead><tr style='border-bottom:2px solid #e5e7eb'><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th><th></th></tr></thead><tbody>" + job_rows + "</tbody></table>" if job_rows else ""}
+  {"<h3 style='color:#1d4ed8;margin:0 0 10px'>✅ " + str(total_jobs) + " New Matching Role(s)</h3><table style='border-collapse:collapse;width:100%'><thead><tr style='border-bottom:2px solid #e5e7eb'><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>POSTED</th><th></th></tr></thead><tbody>" + job_rows + "</tbody></table>" if job_rows else ""}
 
   {"<h3 style='color:#f59e0b;margin:28px 0 6px'>⚠️ Pages Changed — Manual Check Needed</h3><p style='color:#6b7280;font-size:13px;margin:0 0 10px'>These pages updated but jobs couldn't be auto-extracted (JS-rendered sites).</p><table style='border-collapse:collapse;width:100%'><tbody>" + page_rows + "</tbody></table>" if page_rows else ""}
 
@@ -420,7 +522,9 @@ def send_email(results, db_updated):
              "Filters: Project/Program Manager | Senior & Mid | Munich & Nuremberg\n"]
     for r in results:
         for j in r["new_jobs"]:
-            lines += [f"[{r['company']}] {j['title']}", f"  Location: {j['location']}", f"  {j['url']}", ""]
+            posted = j["date_posted"].strftime("%Y-%m-%d") if j.get("date_posted") else "unknown date"
+            lines += [f"[{r['company']}] {j['title']}", f"  Posted:   {posted}",
+                      f"  Location: {j['location']}", f"  {j['url']}", ""]
     for r in results:
         if r["page_changed"] and not r["new_jobs"]:
             lines.append(f"PAGE CHANGED: {r['company']} — {r['company_url']}")
@@ -457,7 +561,7 @@ def send_email(results, db_updated):
 
 def main():
     log.info("── Job Tracker starting %s ──", datetime.now().isoformat())
-    log.info("AI contextual search: %s", "enabled" if AI_ENABLED else "disabled (set ANTHROPIC_API_KEY to enable)")
+    log.info("AI contextual search: %s", "enabled" if AI_ENABLED else "disabled (set GEMINI_API_KEY to enable)")
     init_db()
     existing_db = load_db()
     state       = load_state()
@@ -485,18 +589,28 @@ def main():
             found = ai_validate_jobs(found, name)
 
         # AI layer 2: fallback extraction for JS-heavy pages keyword matching missed
-        if AI_ENABLED and not found and not first_run and changed:
+        if AI_ENABLED and not found and (first_run or changed):
             found = ai_extract_jobs(get_page_text(html), url, name)
 
-        new_jobs = [j for j in found if ci(j["title"]) not in known]
-        log.info("  → %d matching / %d new", len(found), len(new_jobs))
+        # Jobs not yet in the known-titles set (unseen across all previous runs)
+        new_to_known = [j for j in found if ci(j["title"]) not in known]
 
-        # Save new jobs to DB
+        # Date filter: only alert on jobs posted today or yesterday.
+        # Unknown date (None) is included — never silently drop a job we can't date.
+        new_jobs = [j for j in new_to_known if is_recent(j.get("date_posted"))]
+
+        skipped = len(new_to_known) - len(new_jobs)
+        log.info("  → %d matching / %d unseen / %d recent%s",
+                 len(found), len(new_to_known), len(new_jobs),
+                 f" ({skipped} skipped — older posting date)" if skipped else "")
+
+        # Persist new jobs to CSV (all recent unseen ones)
         for j in new_jobs:
             db_key = (name.lower(), ci(j["title"]))
             if db_key not in existing_db:
                 new_db_rows.append({
                     "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+                    "Date Posted":   j["date_posted"].strftime("%Y-%m-%d") if j.get("date_posted") else "",
                     "Company":       name,
                     "Job Title":     j["title"],
                     "Location":      j["location"],
@@ -506,21 +620,25 @@ def main():
                 })
                 existing_db.add(db_key)
 
-        # Log page changes with no parseable jobs
+        # Log page changes with no parseable jobs (only after baseline is set)
         if not first_run and changed and not new_jobs:
             append_page_change_to_db(name, url)
 
-        if first_run:
-            log.info("  → First run: baseline saved")
+        if first_run and new_jobs:
+            log.info("  🆕 First run — alerting on %d recent job(s): %s",
+                     len(new_jobs), [j["title"] for j in new_jobs])
+        elif first_run:
+            log.info("  → First run: baseline saved (no recent postings)")
         elif new_jobs:
             log.info("  🆕 New: %s", [j["title"] for j in new_jobs])
         elif changed:
             log.info("  📄 Page changed, no parseable new jobs")
 
+        # Always update known titles with everything found (prevents stale re-alerts)
         state[f"{name}__hash"] = fp
         state[f"{name}__jobs"] = list(known | {ci(j["title"]) for j in found})
 
-        if not first_run and (new_jobs or changed):
+        if new_jobs or (not first_run and changed):
             results.append({
                 "company":      name,
                 "company_url":  url,
