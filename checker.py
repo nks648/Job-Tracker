@@ -105,6 +105,7 @@ GMAIL_PASSWORD    = os.environ["GMAIL_APP_PASSWORD"]
 # Multiple recipients: comma-separated in the secret
 # e.g. "nagarjun@gmail.com,friend@gmail.com"
 NOTIFY_EMAILS     = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
+BCC_EMAILS        = [e.strip() for e in os.environ.get("BCC_EMAIL", "").split(",") if e.strip()]
 STATE_FILE        = os.environ.get("STATE_FILE", "job_state.json")
 DB_FILE           = "jobs_database.csv"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -732,7 +733,9 @@ def send_email(results, db_updated):
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
-    msg["To"]      = ", ".join(NOTIFY_EMAILS)   # ← multiple recipients
+    msg["To"]      = ", ".join(NOTIFY_EMAILS)
+    if BCC_EMAILS:
+        msg["Bcc"] = ", ".join(BCC_EMAILS)
 
     body = MIMEMultipart("alternative")
     body.attach(MIMEText(plain, "plain"))
@@ -752,8 +755,9 @@ def send_email(results, db_updated):
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_PASSWORD)
-        s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
-    log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
+        s.sendmail(GMAIL_USER, NOTIFY_EMAILS + BCC_EMAILS, msg.as_string())
+    log.info("✉  Email sent to: %s%s", ", ".join(NOTIFY_EMAILS),
+             f" | BCC: {', '.join(BCC_EMAILS)}" if BCC_EMAILS else "")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
