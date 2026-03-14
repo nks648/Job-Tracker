@@ -24,10 +24,10 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    import anthropic as _anthropic_module
-    _ANTHROPIC_AVAILABLE = True
+    import google.generativeai as _genai
+    _GEMINI_AVAILABLE = True
 except ImportError:
-    _ANTHROPIC_AVAILABLE = False
+    _GEMINI_AVAILABLE = False
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -107,8 +107,8 @@ GMAIL_PASSWORD    = os.environ["GMAIL_APP_PASSWORD"]
 NOTIFY_EMAILS     = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
 STATE_FILE        = os.environ.get("STATE_FILE", "job_state.json")
 DB_FILE           = "jobs_database.csv"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-AI_ENABLED        = _ANTHROPIC_AVAILABLE and bool(ANTHROPIC_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+AI_ENABLED     = _GEMINI_AVAILABLE and bool(GEMINI_API_KEY)
 
 DB_COLUMNS = ["Date Recorded", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
@@ -271,15 +271,19 @@ def get_page_text(html):
     return " ".join(soup.get_text(" ", strip=True).split())
 
 
+def _gemini_model():
+    """Return a configured Gemini Flash model (lazy init)."""
+    _genai.configure(api_key=GEMINI_API_KEY)
+    return _genai.GenerativeModel("gemini-2.0-flash")
+
+
 def ai_validate_jobs(jobs, company_name):
-    """Use Claude to contextually filter keyword-matched jobs, removing false positives
+    """Use Gemini to contextually filter keyword-matched jobs, removing false positives
     and surfacing semantic variants the keyword list might miss."""
     if not jobs:
         return jobs
 
-    client = _anthropic_module.Anthropic(api_key=ANTHROPIC_API_KEY)
     titles = [j["title"] for j in jobs]
-
     prompt = (
         f"You are filtering job listings for someone seeking Senior or Mid-level "
         f"Project Manager / Program Manager roles in Munich or Nuremberg, Germany.\n\n"
@@ -295,12 +299,9 @@ def ai_validate_jobs(jobs, company_name):
     )
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        keep = json.loads(response.content[0].text.strip())
+        response = _gemini_model().generate_content(prompt)
+        raw = response.text.strip().strip("```json").strip("```").strip()
+        keep = json.loads(raw)
         if isinstance(keep, list):
             filtered = [jobs[i] for i in keep if isinstance(i, int) and i < len(jobs)]
             log.info("  🤖 AI validation: %d → %d job(s)", len(jobs), len(filtered))
@@ -311,10 +312,8 @@ def ai_validate_jobs(jobs, company_name):
 
 
 def ai_extract_jobs(text, page_url, company_name):
-    """Use Claude to extract relevant jobs from raw page text.
+    """Use Gemini to extract relevant jobs from raw page text.
     Primary use: JS-rendered pages that the HTML parser couldn't parse."""
-    client = _anthropic_module.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     prompt = (
         f"You are analyzing a career page for job listings.\n\n"
         f"Company: {company_name}\nPage URL: {page_url}\n\n"
@@ -331,14 +330,10 @@ def ai_extract_jobs(text, page_url, company_name):
     )
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        extracted = json.loads(response.content[0].text.strip())
+        response = _gemini_model().generate_content(prompt)
+        raw = response.text.strip().strip("```json").strip("```").strip()
+        extracted = json.loads(raw)
         if isinstance(extracted, list):
-            # Fill missing url with the career page url
             for j in extracted:
                 if not j.get("url"):
                     j["url"] = page_url
