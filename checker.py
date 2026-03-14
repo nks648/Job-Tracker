@@ -612,16 +612,23 @@ def ai_validate_jobs(jobs, company_name):
 
 def ai_extract_jobs(text, page_url, company_name):
     """Use Gemini to extract relevant jobs from raw page text.
-    Primary use: JS-rendered pages that the HTML parser couldn't parse."""
+    Sends up to 15 000 chars — enough to cover most static career pages in full.
+    Returns [] for truly JS-rendered pages (empty static HTML after script removal)."""
+    if len(text.strip()) < 200:
+        log.info("  🤖 AI extraction skipped — page text is empty (JS-rendered, no static content)")
+        return []
+
     prompt = (
         f"You are analyzing a career page for job listings.\n\n"
         f"Company: {company_name}\nPage URL: {page_url}\n\n"
-        f"Page text (first 3000 chars):\n{text[:3000]}\n\n"
-        f"Extract job listings that meet ALL of these criteria:\n"
+        f"Page text:\n{text[:15000]}\n\n"
+        f"Extract EVERY job listing that meets ALL of these criteria:\n"
         f"1. Role: Project Manager, Program Manager, or a close equivalent "
-        f"(e.g. Delivery Manager, PMO, IT Project Lead, Projektleiter, Scrum Master if PM-adjacent).\n"
-        f"2. Seniority: NOT junior / intern / trainee / graduate.\n"
-        f"3. Location: Munich, Nuremberg, Bavaria, Germany, Remote, or Hybrid.\n\n"
+        f"(e.g. Delivery Manager, PMO, IT Project Lead, Projektleiter, "
+        f"Programm Manager, Scrum Master if PM-adjacent).\n"
+        f"2. Seniority: NOT junior / intern / trainee / graduate / werkstudent / praktikant.\n"
+        f"3. Location: Munich, Nuremberg, Bavaria, Germany, Remote, or Hybrid "
+        f"(include if location is unspecified — don't exclude on lack of location alone).\n\n"
         f"Return a JSON array of objects with keys: title (string), location (string), url (string).\n"
         f"If a direct job URL is not visible in the text, set url to an empty string.\n"
         f"If no relevant jobs are found, return [].\n"
@@ -638,7 +645,8 @@ def ai_extract_jobs(text, page_url, company_name):
                     j["url"] = page_url
                 if not j.get("location"):
                     j["location"] = "See posting"
-            log.info("  🤖 AI extraction: found %d job(s) from page text", len(extracted))
+            log.info("  🤖 AI extraction: found %d job(s) from %d chars of page text",
+                     len(extracted), len(text))
             return extracted
     except Exception as exc:
         log.warning("  ⚠  AI extraction failed (%s)", exc)
@@ -652,7 +660,6 @@ def send_email(results, db_updated):
     page_changes = sum(1 for r in results if r["page_changed"] and not r["new_jobs"])
     date_str     = datetime.today().strftime("%d %b %Y")
 
-    total_items = total_jobs + page_changes
     subject = (
         f"🚨 Job Alert: {total_jobs} new role(s)"
         + (f" + {page_changes} to check" if page_changes else "")
@@ -679,13 +686,15 @@ def send_email(results, db_updated):
     page_rows = ""
     for r in results:
         if r["page_changed"] and not r["new_jobs"]:
+            note = ("JS-rendered — no static content for AI to parse"
+                    if r.get("js_rendered")
+                    else "Page updated — AI found no matching roles")
             page_rows += (
                 f"<tr style='border-bottom:1px solid #f3f4f6'>"
                 f"<td style='padding:12px 14px 12px 0;font-weight:600;font-size:14px'>"
                 f"<a href='{r['company_url']}' style='color:#111;text-decoration:none'>{r['company']}</a>"
                 f"</td>"
-                f"<td style='padding:12px 14px 12px 0;font-size:13px;color:#6b7280'>"
-                f"Career page updated — new positions may be listed</td>"
+                f"<td style='padding:12px 14px 12px 0;font-size:13px;color:#6b7280'>{note}</td>"
                 f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>—</td>"
                 f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>—</td>"
                 f"<td style='padding:12px 0'>"
@@ -820,8 +829,11 @@ def main():
         if AI_ENABLED and found:
             found = ai_validate_jobs(found, name)
 
-        # AI layer 2: fallback extraction for JS-heavy pages (HTML only — API sources already structured)
-        if AI_ENABLED and html and not found and (first_run or changed):
+        # AI layer 2: fallback extraction when keyword matching found nothing.
+        # Runs on every check (not just first_run/changed) — same jobs won't re-alert
+        # because they'll already be in the `known` set from a previous run.
+        # Skipped for API-sourced companies (they already return structured data).
+        if AI_ENABLED and html and not found:
             found = ai_extract_jobs(get_page_text(html), url, name)
 
         # Jobs not yet in the known-titles set (unseen across all previous runs)
@@ -870,12 +882,14 @@ def main():
         state[f"{name}__hash"] = fp
         state[f"{name}__jobs"] = list(known | {ci(j["title"]) for j in found})
 
+        page_text_len = len(get_page_text(html).strip()) if html else 0
         if new_jobs or (not first_run and changed):
             results.append({
                 "company":      name,
                 "company_url":  url,
                 "new_jobs":     new_jobs,
                 "page_changed": changed,
+                "js_rendered":  html is not None and page_text_len < 200,
             })
 
     # Write new rows to CSV
