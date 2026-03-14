@@ -218,14 +218,45 @@ def _parse_jsonld_dates(html):
 
 
 def _tag_date(tag):
-    """Search a BeautifulSoup tag for a date: time[datetime] element or relative text."""
+    """Search a BeautifulSoup tag for a date using multiple HTML patterns."""
     if tag is None:
         return None
+    # 1. <time datetime="2026-03-14">
     time_el = tag.find("time", attrs={"datetime": True})
     if time_el:
         d = _parse_date_str(time_el["datetime"])
         if d:
             return d
+    # 2. <meta itemprop="datePosted" content="2026-03-14">
+    meta = tag.find("meta", attrs={"itemprop": "datePosted"})
+    if meta and meta.get("content"):
+        d = _parse_date_str(meta["content"])
+        if d:
+            return d
+    # 3. data-date / data-posted / data-dateposted attributes anywhere in the container
+    for attr in ("data-date", "data-posted", "data-dateposted", "data-created"):
+        el = tag.find(attrs={attr: True})
+        if el:
+            d = _parse_date_str(el[attr])
+            if d:
+                return d
+    # 4. CSS class heuristics — look for a date string inside likely elements
+    for cls_pattern in ("date-posted", "posting-date", "job-date", "posted-on",
+                        "published-date", "listdate", "date_posted"):
+        el = tag.find(class_=re.compile(cls_pattern, re.I))
+        if el:
+            d = _parse_date_str(el.get_text(strip=True)) or _relative_to_date(el.get_text(strip=True))
+            if d:
+                return d
+    # 5. aria-label containing "posted" + a recognisable date
+    for el in tag.find_all(attrs={"aria-label": re.compile(r"posted", re.I)}):
+        label = el.get("aria-label", "")
+        m = re.search(r'\d{4}-\d{2}-\d{2}', label)
+        if m:
+            d = _parse_date_str(m.group())
+            if d:
+                return d
+    # 6. Relative date text anywhere in the container
     return _relative_to_date(tag.get_text(" ", strip=True))
 
 
@@ -280,6 +311,90 @@ def append_page_change_to_db(company, career_url):
             "Career Page":   career_url,
             "Status":        "Needs Manual Check",
         })
+
+# ── Native API fetchers (Greenhouse & Lever) ───────────────────────────────────
+
+def fetch_greenhouse_jobs(career_url):
+    """Use the Greenhouse public board API instead of HTML scraping.
+    Returns (fingerprint_str | None, jobs_list).
+    Board token is the last path segment of the career URL."""
+    board_token = urlparse(career_url).path.strip("/").split("/")[-1]
+    api_url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Greenhouse API error (%s): %s", career_url, exc)
+        return None, []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        title    = j.get("title", "")
+        location = j.get("location", {}).get("name", "See posting")
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        # updated_at is the best available public date (created_at needs Harvest API auth)
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         j.get("absolute_url", career_url),
+            "date_posted": _parse_date_str(j.get("updated_at", "")),
+        })
+
+    # Fingerprint = sorted job IDs so state machine detects additions/removals
+    fp = json.dumps(sorted(str(j.get("id", "")) for j in data.get("jobs", [])))
+    log.info("  📡 Greenhouse API: %d total / %d matching", len(data.get("jobs", [])), len(jobs))
+    return fp, jobs
+
+
+def fetch_lever_jobs(career_url):
+    """Use the Lever public postings API instead of HTML scraping.
+    Returns (fingerprint_str | None, jobs_list).
+    Company slug is the first path segment of the career URL."""
+    company_slug = urlparse(career_url).path.strip("/").split("/")[0]
+    api_url = f"https://api.lever.co/v0/postings/{company_slug}?mode=json"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        postings = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Lever API error (%s): %s", career_url, exc)
+        return None, []
+
+    jobs = []
+    for j in postings:
+        title = j.get("text", "")
+        if not is_relevant_role(title):
+            continue
+        cats     = j.get("categories", {}) or {}
+        location = cats.get("location", "") or ""
+        if not location and isinstance(cats.get("allLocations"), list):
+            location = cats["allLocations"][0] if cats["allLocations"] else ""
+        if location and not is_relevant_location(location):
+            continue
+        # createdAt is Unix milliseconds (undocumented but present in practice)
+        d = None
+        created_ms = j.get("createdAt")
+        if created_ms:
+            try:
+                from datetime import timezone
+                d = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc).date()
+            except Exception:
+                pass
+        jobs.append({
+            "title":       title,
+            "location":    location or "See posting",
+            "url":         j.get("hostedUrl", career_url),
+            "date_posted": d,
+        })
+
+    fp = json.dumps(sorted(j.get("id", "") for j in postings))
+    log.info("  📡 Lever API: %d total / %d matching", len(postings), len(jobs))
+    return fp, jobs
+
 
 # ── Job extraction ─────────────────────────────────────────────────────────────
 
@@ -572,24 +687,36 @@ def main():
         name, url = company["name"], company["url"]
         log.info("Checking: %s", name)
 
-        html = fetch(url)
-        if not html:
-            continue
+        # Route to native API or HTML scraping depending on the platform
+        html      = None
+        fp_source = None
+        if "greenhouse.io" in url:
+            fp_source, found = fetch_greenhouse_jobs(url)
+        elif "lever.co" in url:
+            fp_source, found = fetch_lever_jobs(url)
+        else:
+            html = fetch(url)
+            if not html:
+                continue
+            fp_source = html
+            found = extract_jobs(html, url)
 
-        fp        = page_fingerprint(html)
+        if fp_source is None:
+            continue  # API or fetch error — skip this company
+
+        # Fingerprint: hash HTML (boilerplate-stripped) or the API response string
+        fp        = page_fingerprint(fp_source) if html else hashlib.sha256(fp_source.encode()).hexdigest()
         old_fp    = state.get(f"{name}__hash")
         known     = set(state.get(f"{name}__jobs", []))
         first_run = old_fp is None
         changed   = (not first_run) and (fp != old_fp)
 
-        found = extract_jobs(html, url)
-
         # AI layer 1: contextually validate keyword-matched jobs
         if AI_ENABLED and found:
             found = ai_validate_jobs(found, name)
 
-        # AI layer 2: fallback extraction for JS-heavy pages keyword matching missed
-        if AI_ENABLED and not found and (first_run or changed):
+        # AI layer 2: fallback extraction for JS-heavy pages (HTML only — API sources already structured)
+        if AI_ENABLED and html and not found and (first_run or changed):
             found = ai_extract_jobs(get_page_text(html), url, name)
 
         # Jobs not yet in the known-titles set (unseen across all previous runs)
