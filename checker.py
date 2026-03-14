@@ -285,13 +285,19 @@ def init_db():
         log.info("Created new jobs_database.csv")
 
 def load_db():
-    """Load existing records as a set of (company, title) tuples to avoid duplicates."""
+    """Load existing records to avoid duplicates.
+    Returns a set of (company, title) tuples for job dedup
+    plus (company, '__page_change_today__') for same-day page-change dedup."""
     existing = set()
+    today = datetime.today().strftime("%Y-%m-%d")
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 existing.add((row["Company"].lower(), row["Job Title"].lower()))
+                if (row.get("Date Recorded") == today
+                        and "page changed" in row.get("Job Title", "").lower()):
+                    existing.add((row["Company"].lower(), "__page_change_today__"))
     return existing
 
 def append_to_db(records):
@@ -786,7 +792,11 @@ def send_email(results, db_updated):
 
 def main():
     log.info("── Job Tracker starting %s ──", datetime.now().isoformat())
-    log.info("AI contextual search: %s", "enabled" if AI_ENABLED else "disabled (set GEMINI_API_KEY to enable)")
+    if AI_ENABLED:
+        log.info("AI contextual search: ENABLED (Gemini Flash)")
+    else:
+        log.warning("AI contextual search: DISABLED — add GEMINI_API_KEY as a GitHub Actions secret "
+                    "(Settings → Secrets → New secret → name: GEMINI_API_KEY)")
     init_db()
     existing_db = load_db()
     state       = load_state()
@@ -864,9 +874,11 @@ def main():
                 })
                 existing_db.add(db_key)
 
-        # Log page changes with no parseable jobs (only after baseline is set)
-        if not first_run and changed and not new_jobs:
+        # Log page changes with no parseable jobs — at most once per company per day
+        page_change_today = (name.lower(), "__page_change_today__")
+        if not first_run and changed and not new_jobs and page_change_today not in existing_db:
             append_page_change_to_db(name, url)
+            existing_db.add(page_change_today)
 
         if first_run and new_jobs:
             log.info("  🆕 First run — alerting on %d recent job(s): %s",
