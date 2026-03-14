@@ -652,9 +652,10 @@ def send_email(results, db_updated):
     page_changes = sum(1 for r in results if r["page_changed"] and not r["new_jobs"])
     date_str     = datetime.today().strftime("%d %b %Y")
 
+    total_items = total_jobs + page_changes
     subject = (
-        f"🚨 Job Alert: {total_jobs} new role(s) found"
-        + (f" + {page_changes} page change(s)" if page_changes else "")
+        f"🚨 Job Alert: {total_jobs} new role(s)"
+        + (f" + {page_changes} to check" if page_changes else "")
         + f" — {date_str}"
     )
 
@@ -680,11 +681,17 @@ def send_email(results, db_updated):
         if r["page_changed"] and not r["new_jobs"]:
             page_rows += (
                 f"<tr style='border-bottom:1px solid #f3f4f6'>"
-                f"<td style='padding:10px 14px 10px 0;font-weight:600'>{r['company']}</td>"
-                f"<td colspan='2' style='padding:10px 14px 10px 0;color:#6b7280;font-size:13px'>"
-                f"Page updated — likely JS-rendered, check manually</td>"
-                f"<td><a href='{r['company_url']}' style='color:#2563eb;font-size:13px'>Visit →</a></td>"
-                f"</tr>"
+                f"<td style='padding:12px 14px 12px 0;font-weight:600;font-size:14px'>"
+                f"<a href='{r['company_url']}' style='color:#111;text-decoration:none'>{r['company']}</a>"
+                f"</td>"
+                f"<td style='padding:12px 14px 12px 0;font-size:13px;color:#6b7280'>"
+                f"Career page updated — new positions may be listed</td>"
+                f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>—</td>"
+                f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>—</td>"
+                f"<td style='padding:12px 0'>"
+                f"<a href='{r['company_url']}' style='background:#f59e0b;color:#fff;padding:5px 14px;"
+                f"border-radius:5px;text-decoration:none;font-size:13px;font-weight:600'>Check →</a>"
+                f"</td></tr>"
             )
 
     db_note = (
@@ -704,9 +711,16 @@ def send_email(results, db_updated):
     </p>
   </div>
 
-  {"<h3 style='color:#1d4ed8;margin:0 0 10px'>✅ " + str(total_jobs) + " New Matching Role(s)</h3><table style='border-collapse:collapse;width:100%'><thead><tr style='border-bottom:2px solid #e5e7eb'><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>POSTED</th><th></th></tr></thead><tbody>" + job_rows + "</tbody></table>" if job_rows else ""}
-
-  {"<h3 style='color:#f59e0b;margin:28px 0 6px'>⚠️ Pages Changed — Manual Check Needed</h3><p style='color:#6b7280;font-size:13px;margin:0 0 10px'>These pages updated but jobs couldn't be auto-extracted (JS-rendered sites).</p><table style='border-collapse:collapse;width:100%'><tbody>" + page_rows + "</tbody></table>" if page_rows else ""}
+  <table style='border-collapse:collapse;width:100%'>
+    <thead><tr style='border-bottom:2px solid #e5e7eb'>
+      <th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th>
+      <th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th>
+      <th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th>
+      <th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>POSTED</th>
+      <th></th>
+    </tr></thead>
+    <tbody>{job_rows}{page_rows}</tbody>
+  </table>
 
   {db_note}
 
@@ -726,16 +740,17 @@ def send_email(results, db_updated):
                       f"  Location: {j['location']}", f"  {j['url']}", ""]
     for r in results:
         if r["page_changed"] and not r["new_jobs"]:
-            lines.append(f"PAGE CHANGED: {r['company']} — {r['company_url']}")
+            lines += [f"[{r['company']}] Career page updated — check for new positions",
+                      f"  {r['company_url']}", ""]
     plain = "\n".join(lines)
 
     # Build message
     msg = MIMEMultipart("mixed")
+    all_bcc = NOTIFY_EMAILS + BCC_EMAILS
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
-    msg["To"]      = ", ".join(NOTIFY_EMAILS)
-    if BCC_EMAILS:
-        msg["Bcc"] = ", ".join(BCC_EMAILS)
+    msg["To"]      = GMAIL_USER          # sender only in To — all recipients are hidden in Bcc
+    msg["Bcc"]     = ", ".join(all_bcc)
 
     body = MIMEMultipart("alternative")
     body.attach(MIMEText(plain, "plain"))
@@ -755,9 +770,8 @@ def send_email(results, db_updated):
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_PASSWORD)
-        s.sendmail(GMAIL_USER, NOTIFY_EMAILS + BCC_EMAILS, msg.as_string())
-    log.info("✉  Email sent to: %s%s", ", ".join(NOTIFY_EMAILS),
-             f" | BCC: {', '.join(BCC_EMAILS)}" if BCC_EMAILS else "")
+        s.sendmail(GMAIL_USER, all_bcc, msg.as_string())
+    log.info("✉  Email sent (BCC) to: %s", ", ".join(all_bcc))
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
