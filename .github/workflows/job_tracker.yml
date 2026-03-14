@@ -1,0 +1,58 @@
+name: Daily Job Tracker
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore job state cache
+        uses: actions/cache@v4
+        with:
+          path: job_state.json
+          key: job-state-${{ github.run_id }}
+          restore-keys: |
+            job-state-
+
+      - name: Run job checker
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:       ${{ secrets.NOTIFY_EMAIL }}
+        run: python checker.py
+
+      - name: Save updated job state
+        uses: actions/cache@v4
+        with:
+          path: job_state.json
+          key: job-state-${{ github.run_id }}
+```
+
+**Step 4** — Click **Commit changes** → **Commit changes** again in the popup.
+
+---
+
+After this your repo will look exactly right:
+```
+Job-Tracker/
+├── checker.py
+├── requirements.txt
+└── .github/
+    └── workflows/
+        └── job_tracker.yml
