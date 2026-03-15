@@ -753,11 +753,15 @@ _LI_HEADERS = {
 }
 
 
-def _linkedin_posted_date(job_title, company_name):
+def _linkedin_check(job_title, company_name):
     """Search LinkedIn for job_title + company_name.
 
-    Returns the posting date (date object) of the best matching result,
-    or None when not found / request blocked (caller must fail open).
+    Returns (posted_date, is_repost) for the best matching card, or (None, False)
+    when not found / request blocked (caller must fail open).
+
+    LinkedIn shows "Reposted X days ago" for ghost jobs recycled from months ago.
+    The datetime attribute reflects the repost date (recent), not the original,
+    so we detect the word "repost" in the visible label text instead.
     """
     query = f"{job_title} {company_name}"
     url   = (
@@ -768,7 +772,7 @@ def _linkedin_posted_date(job_title, company_name):
         resp = requests.get(url, headers=_LI_HEADERS, timeout=15)
         if resp.status_code != 200:
             log.debug("  LinkedIn returned %d for '%s'", resp.status_code, job_title)
-            return None
+            return None, False
 
         soup = BeautifulSoup(resp.text, "lxml")
         for card in soup.select(".base-card, .job-search-card"):
@@ -780,26 +784,32 @@ def _linkedin_posted_date(job_title, company_name):
             # Loose match: first 15 chars of title + first 10 of company name
             if (ci(job_title[:15]) in ci(title_el.get_text()) and
                     ci(company_name[:10]) in ci(company_el.get_text())):
+                is_repost = "repost" in ci(time_el.get_text())
                 try:
-                    return date.fromisoformat(time_el["datetime"][:10])
+                    return date.fromisoformat(time_el["datetime"][:10]), is_repost
                 except (ValueError, KeyError):
-                    pass
+                    return None, is_repost
     except Exception as exc:
         log.debug("  LinkedIn check error for '%s': %s", job_title, exc)
-    return None
+    return None, False
 
 
 def linkedin_is_fresh(job_title, company_name):
     """Return True if the job should be alerted (fresh or unseen on LinkedIn).
 
-    Returns False only when the job is confidently found on LinkedIn AND is
-    older than LINKEDIN_MAX_AGE days.  On any doubt, returns True (fail open).
+    Skips when:
+      • Found on LinkedIn AND is_repost=True  → ghost job, already circulated
+      • Found on LinkedIn AND age > LINKEDIN_MAX_AGE days → stale listing
+    Includes (fail open) when not found or any error occurs.
     """
     if not LINKEDIN_VALIDATE:
         return True
-    posted = _linkedin_posted_date(job_title, company_name)
-    if posted is None:
+    posted, is_repost = _linkedin_check(job_title, company_name)
+    if posted is None and not is_repost:
         return True   # not on LinkedIn yet = brand new, or check failed = include
+    if is_repost:
+        log.info("  ⏭  Skipping '%s' — reposted on LinkedIn (ghost job)", job_title)
+        return False
     age = (date.today() - posted).days
     if age > LINKEDIN_MAX_AGE:
         log.info("  ⏭  Skipping '%s' — already on LinkedIn (%d days old)", job_title, age)
