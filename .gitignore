@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+job_state.json
+jobs_database.csv
