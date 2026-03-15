@@ -493,6 +493,139 @@ def fetch_recruitee_jobs(career_url):
     return fp, jobs
 
 
+def fetch_phenom_jobs(career_url):
+    """Use the Phenom TXM public REST API to get structured job data.
+
+    Phenom is the ATS behind Applied Materials (careers.appliedmaterials.com),
+    Infineon (jobs.infineon.com), and others.  The `domain=` query param in the
+    career page URL tells us the Phenom tenant domain.
+    Returns (fingerprint_str | None, jobs_list).
+    """
+    parsed   = urlparse(career_url)
+    qs       = parse_qs(parsed.query)
+    domain   = qs.get("domain", [parsed.hostname])[0]
+    api_url  = f"https://{parsed.hostname}/api/apply/v2/jobs"
+    params   = {"domain": domain, "start": 0, "num": 100, "sort_by": "relevance"}
+    try:
+        resp = requests.get(api_url, params=params, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Phenom API error (%s): %s", career_url, exc)
+        return None, []
+
+    all_positions = data.get("positions", [])
+    jobs = []
+    for j in all_positions:
+        title    = j.get("name", "") or j.get("title", "")
+        location = j.get("location", "") or "See posting"
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         j.get("canonicalPositionUrl", career_url),
+            "date_posted": _parse_date_str(j.get("datePosted", "") or j.get("updatedAt", "")),
+        })
+
+    fp = json.dumps(sorted(str(j.get("id", "")) for j in all_positions))
+    log.info("  📡 Phenom API: %d total / %d matching", len(all_positions), len(jobs))
+    return fp, jobs
+
+
+def fetch_jobvite_jobs(career_url):
+    """Use the Jobvite public job list API.
+
+    Jobvite career sites always have `createNewAlert=false` in their search URLs.
+    The public API endpoint /api/get_job_list returns all active postings as JSON.
+    Used by: Hensoldt (jobs.hensoldt.net), SAP AG (jobs.sap.com),
+             KraussMaffei (jobs.kraussmaffei.com), SES Sat (careers.ses.com).
+    Returns (fingerprint_str | None, jobs_list).
+    """
+    parsed  = urlparse(career_url)
+    api_url = f"https://{parsed.hostname}/api/get_job_list"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Jobvite API error (%s): %s", career_url, exc)
+        return None, []
+
+    raw_jobs = data.get("jobs", data) if isinstance(data, dict) else data
+    if not isinstance(raw_jobs, list):
+        raw_jobs = []
+
+    jobs = []
+    for j in raw_jobs:
+        title    = j.get("title", "")
+        loc_data = j.get("location", {}) or {}
+        location = (
+            loc_data.get("city", "") or
+            j.get("city", "") or
+            "See posting"
+        )
+        country  = loc_data.get("country", "") or j.get("country", "")
+        if location != "See posting" and country:
+            location = f"{location}, {country}"
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         j.get("url", career_url),
+            "date_posted": _parse_date_str(j.get("date", "") or j.get("datePosted", "")),
+        })
+
+    fp = json.dumps(sorted(str(j.get("id", "")) for j in raw_jobs))
+    log.info("  📡 Jobvite API: %d total / %d matching", len(raw_jobs), len(jobs))
+    return fp, jobs
+
+
+def fetch_personio_jobs(career_url):
+    """Use the Personio public JSON feed.
+
+    Personio career pages expose a /json endpoint on the same subdomain.
+    Used by: Stark (stark.jobs.personio.com), Reverion (reverion.jobs.personio.de).
+    Returns (fingerprint_str | None, jobs_list).
+    """
+    parsed  = urlparse(career_url)
+    api_url = f"https://{parsed.hostname}/json"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Personio API error (%s): %s", career_url, exc)
+        return None, []
+
+    raw_jobs = data if isinstance(data, list) else data.get("positions", [])
+    jobs = []
+    for j in raw_jobs:
+        title    = j.get("name", "")
+        location = j.get("office", "") or j.get("location", "") or "See posting"
+        if not is_relevant_role(title):
+            continue
+        if location != "See posting" and not is_relevant_location(location):
+            continue
+        job_id  = j.get("id", "")
+        job_url = f"https://{parsed.hostname}/job/{job_id}" if job_id else career_url
+        jobs.append({
+            "title":       title,
+            "location":    location,
+            "url":         job_url,
+            "date_posted": _parse_date_str(j.get("created_at", "")),
+        })
+
+    fp = json.dumps(sorted(str(j.get("id", "")) for j in raw_jobs))
+    log.info("  📡 Personio API: %d total / %d matching", len(raw_jobs), len(jobs))
+    return fp, jobs
+
+
 # ── Job extraction ─────────────────────────────────────────────────────────────
 
 def extract_jobs(html, page_url):
@@ -966,6 +1099,7 @@ def main():
         log.info("Checking: %s", name)
 
         # Route to native API or HTML scraping depending on the platform
+        # Detection order matters — check most specific patterns first.
         html      = None
         fp_source = None
         if "greenhouse.io" in url:
@@ -976,6 +1110,17 @@ def main():
             fp_source, found = fetch_workday_jobs(url)
         elif "recruitee.com" in url:
             fp_source, found = fetch_recruitee_jobs(url)
+        elif "personio." in url:
+            # Personio: stark.jobs.personio.com, reverion.jobs.personio.de, etc.
+            fp_source, found = fetch_personio_jobs(url)
+        elif "createNewAlert=" in url:
+            # Jobvite: jobs.hensoldt.net, jobs.sap.com, jobs.kraussmaffei.com,
+            #          careers.ses.com — all share the same Jobvite URL pattern
+            fp_source, found = fetch_jobvite_jobs(url)
+        elif "pid=" in url and "domain=" in url:
+            # Phenom TXM: careers.appliedmaterials.com, jobs.infineon.com — the
+            # pid= and domain= params are Phenom-specific query parameters
+            fp_source, found = fetch_phenom_jobs(url)
         else:
             html = fetch(url)
             if not html:
