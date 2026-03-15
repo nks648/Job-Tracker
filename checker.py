@@ -108,8 +108,11 @@ NOTIFY_EMAILS     = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USE
 BCC_EMAILS        = [e.strip() for e in os.environ.get("BCC_EMAIL", "").split(",") if e.strip()]
 STATE_FILE        = os.environ.get("STATE_FILE", "job_state.json")
 DB_FILE           = "jobs_database.csv"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-AI_ENABLED     = _GEMINI_AVAILABLE and bool(GEMINI_API_KEY)
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+AI_ENABLED          = _GEMINI_AVAILABLE and bool(GEMINI_API_KEY)
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ENABLED    = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 DB_COLUMNS = ["Date Recorded", "Date Posted", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
@@ -268,10 +271,11 @@ def _tag_date(tag):
 
 
 def is_recent(d):
-    """True if posting date is today, yesterday, or unknown (None → include, never miss a job)."""
+    """True if posting date is within the last 2 days, or unknown (None → include).
+    2-day window provides safety buffer when 3x-daily runs overlap day boundaries."""
     if d is None:
         return True
-    return d >= date.today() - timedelta(days=1)
+    return d >= date.today() - timedelta(days=2)
 
 
 # ── CSV Database ───────────────────────────────────────────────────────────────
@@ -657,6 +661,73 @@ def ai_extract_jobs(text, page_url, company_name):
     except Exception as exc:
         log.warning("  ⚠  AI extraction failed (%s)", exc)
     return []
+
+
+def ai_job_brief(job_url, job_title, company_name):
+    """Fetch the job page and ask Gemini for a 3-bullet application brief.
+    Returns a short HTML string or empty string if AI is disabled / fetch fails."""
+    if not AI_ENABLED:
+        return ""
+    html = fetch(job_url)
+    if not html:
+        return ""
+    text = get_page_text(html)
+    if len(text.strip()) < 100:
+        return ""
+    prompt = (
+        f"You are a career coach helping a candidate apply for this job quickly and effectively.\n\n"
+        f"Job title: {job_title}\nCompany: {company_name}\n\n"
+        f"Job description (truncated):\n{text[:6000]}\n\n"
+        f"Return a JSON object with exactly these keys:\n"
+        f"  'requirements': list of 3 strings — the most important requirements from the JD\n"
+        f"  'lead_with': string — one sentence: the single strongest angle this candidate should lead with\n"
+        f"  'keywords': list of 4-5 resume/cover-letter keywords from the JD\n"
+        f"Return ONLY the JSON object, no explanation."
+    )
+    try:
+        response = _gemini_model().generate_content(prompt)
+        raw = response.text.strip().strip("```json").strip("```").strip()
+        brief = json.loads(raw)
+        reqs = "".join(f"<li style='margin:2px 0'>{r}</li>" for r in brief.get("requirements", []))
+        kws  = ", ".join(f"<code>{k}</code>" for k in brief.get("keywords", []))
+        lead = brief.get("lead_with", "")
+        return (
+            f"<div style='margin-top:8px;padding:10px 14px;background:#f8fafc;"
+            f"border-left:3px solid #2563eb;border-radius:0 6px 6px 0;font-size:12px'>"
+            f"<strong style='color:#1d4ed8'>Key requirements:</strong>"
+            f"<ul style='margin:4px 0 6px 0;padding-left:16px;color:#374151'>{reqs}</ul>"
+            f"<strong style='color:#1d4ed8'>Lead with:</strong> "
+            f"<span style='color:#374151'>{lead}</span><br>"
+            f"<strong style='color:#1d4ed8'>Keywords:</strong> {kws}"
+            f"</div>"
+        )
+    except Exception as exc:
+        log.warning("  ⚠  AI job brief failed for %s: %s", job_title, exc)
+        return ""
+
+
+def send_telegram(jobs_by_company):
+    """Send an instant Telegram message for each new job found."""
+    if not TELEGRAM_ENABLED or not jobs_by_company:
+        return
+    lines = ["🚨 *New job alert*\n"]
+    for company, jobs in jobs_by_company:
+        for j in jobs:
+            posted = j["date_posted"].strftime("%d %b") if j.get("date_posted") else "today"
+            lines.append(f"*{company}* — {j['title']}")
+            lines.append(f"📍 {j['location']}  |  📅 {posted}")
+            lines.append(f"[Apply →]({j['url']})\n")
+    text = "\n".join(lines)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                  "parse_mode": "Markdown", "disable_web_page_preview": True},
+            timeout=15,
+        )
+        log.info("📱 Telegram alert sent")
+    except Exception as exc:
+        log.warning("  ⚠  Telegram send failed: %s", exc)
 
 
 # ── Email ──────────────────────────────────────────────────────────────────────
