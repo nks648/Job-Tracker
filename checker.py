@@ -15,7 +15,7 @@ import csv
 import logging
 import time
 from datetime import datetime, date, timedelta
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, parse_qs
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -332,7 +332,28 @@ def append_page_change_to_db(company, career_url):
             "Status":        "Needs Manual Check",
         })
 
-# ── Native API fetchers (Greenhouse & Lever) ───────────────────────────────────
+# ── Native API fetchers ────────────────────────────────────────────────────────
+
+def _fetch_api_json(api_url, api_name, career_url, method="GET", **kwargs):
+    """Shared HTTP helper for all ATS API fetchers.
+    Returns parsed JSON dict/list, or None on any error."""
+    try:
+        fn   = requests.post if method == "POST" else requests.get
+        resp = fn(api_url, headers=HEADERS, timeout=25, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  %s API error (%s): %s", api_name, career_url, exc)
+        return None
+
+
+def _api_fingerprint(raw_list, api_name, matched_count, id_field="id"):
+    """Build a stable fingerprint string from a list of API job records and log summary.
+    Fingerprint = sorted job IDs so the state machine detects additions/removals."""
+    fp = json.dumps(sorted(str(j.get(id_field, "")) for j in raw_list))
+    log.info("  📡 %s API: %d total / %d matching", api_name, len(raw_list), matched_count)
+    return fp
+
 
 def fetch_greenhouse_jobs(career_url):
     """Use the Greenhouse public board API instead of HTML scraping.
@@ -340,16 +361,13 @@ def fetch_greenhouse_jobs(career_url):
     Board token is the last path segment of the career URL."""
     board_token = urlparse(career_url).path.strip("/").split("/")[-1]
     api_url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Greenhouse API error (%s): %s", career_url, exc)
+    data = _fetch_api_json(api_url, "Greenhouse", career_url)
+    if data is None:
         return None, []
 
+    all_jobs = data.get("jobs", [])
     jobs = []
-    for j in data.get("jobs", []):
+    for j in all_jobs:
         title    = j.get("title", "")
         location = j.get("location", {}).get("name", "See posting")
         if not is_relevant_role(title):
@@ -364,10 +382,7 @@ def fetch_greenhouse_jobs(career_url):
             "date_posted": _parse_date_str(j.get("updated_at", "")),
         })
 
-    # Fingerprint = sorted job IDs so state machine detects additions/removals
-    fp = json.dumps(sorted(str(j.get("id", "")) for j in data.get("jobs", [])))
-    log.info("  📡 Greenhouse API: %d total / %d matching", len(data.get("jobs", [])), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(all_jobs, "Greenhouse", len(jobs)), jobs
 
 
 def fetch_lever_jobs(career_url):
@@ -375,15 +390,12 @@ def fetch_lever_jobs(career_url):
     Returns (fingerprint_str | None, jobs_list).
     Company slug is the first path segment of the career URL."""
     company_slug = urlparse(career_url).path.strip("/").split("/")[0]
-    api_url = f"https://api.lever.co/v0/postings/{company_slug}?mode=json"
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        postings = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Lever API error (%s): %s", career_url, exc)
+    api_url   = f"https://api.lever.co/v0/postings/{company_slug}?mode=json"
+    postings  = _fetch_api_json(api_url, "Lever", career_url)
+    if postings is None:
         return None, []
 
+    from datetime import timezone  # stdlib — no cost to import here
     jobs = []
     for j in postings:
         title = j.get("text", "")
@@ -400,7 +412,6 @@ def fetch_lever_jobs(career_url):
         created_ms = j.get("createdAt")
         if created_ms:
             try:
-                from datetime import timezone
                 d = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc).date()
             except Exception:
                 pass
@@ -411,34 +422,31 @@ def fetch_lever_jobs(career_url):
             "date_posted": d,
         })
 
-    fp = json.dumps(sorted(j.get("id", "") for j in postings))
-    log.info("  📡 Lever API: %d total / %d matching", len(postings), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(postings, "Lever", len(jobs)), jobs
 
 
 def fetch_workday_jobs(career_url):
     """Use the unofficial Workday CXS POST API to get jobs with real postedOn dates.
     Company slug = subdomain; site = first path segment of the career URL."""
-    parsed     = urlparse(career_url)
-    company    = parsed.hostname.split(".")[0]          # e.g. "ag" or "arianegroup"
-    site       = parsed.path.strip("/").split("/")[0]   # e.g. "Airbus" or "EXTERNALALL"
+    parsed  = urlparse(career_url)
+    company = parsed.hostname.split(".")[0]          # e.g. "ag" or "arianegroup"
+    site    = parsed.path.strip("/").split("/")[0]   # e.g. "Airbus" or "EXTERNALALL"
     # Strip locale prefix if present (e.g. "fr-FR/EXTERNALALL" → "EXTERNALALL")
     if re.match(r'^[a-z]{2}-[A-Z]{2}$', site):
         parts = parsed.path.strip("/").split("/")
-        site = parts[1] if len(parts) > 1 else site
+        site  = parts[1] if len(parts) > 1 else site
     api_url = f"https://{parsed.hostname}/wday/cxs/{company}/{site}/jobs"
-    try:
-        resp = requests.post(api_url, json={"appliedFacets": {}, "limit": 100, "offset": 0,
-                                            "searchText": ""},
-                             headers={**HEADERS, "Content-Type": "application/json"}, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Workday CXS API error (%s): %s", career_url, exc)
+    data    = _fetch_api_json(
+        api_url, "Workday CXS", career_url, method="POST",
+        json={"appliedFacets": {}, "limit": 100, "offset": 0, "searchText": ""},
+        headers={**HEADERS, "Content-Type": "application/json"},
+    )
+    if data is None:
         return None, []
 
+    all_postings = data.get("jobPostings", [])
     jobs = []
-    for j in data.get("jobPostings", []):
+    for j in all_postings:
         title    = j.get("title", "")
         location = j.get("locationsText", "See posting")
         if not is_relevant_role(title):
@@ -454,7 +462,7 @@ def fetch_workday_jobs(career_url):
             "date_posted": _parse_date_str(j.get("postedOn", "")),
         })
 
-    all_postings = data.get("jobPostings", [])
+    # Workday doesn't expose stable IDs publicly; use title+date as fingerprint key
     fp = json.dumps(sorted(j.get("title", "") + j.get("postedOn", "") for j in all_postings))
     log.info("  📡 Workday CXS API: %d total / %d matching", len(all_postings), len(jobs))
     return fp, jobs
@@ -464,16 +472,13 @@ def fetch_recruitee_jobs(career_url):
     """Use the Recruitee public offers API. Company slug = subdomain."""
     company = urlparse(career_url).hostname.split(".")[0]
     api_url = f"https://{company}.recruitee.com/api/offers/"
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Recruitee API error (%s): %s", career_url, exc)
+    data    = _fetch_api_json(api_url, "Recruitee", career_url)
+    if data is None:
         return None, []
 
+    all_offers = data.get("offers", [])
     jobs = []
-    for j in data.get("offers", []):
+    for j in all_offers:
         title    = j.get("title", "")
         location = j.get("location", "") or j.get("city", "") or "See posting"
         if not is_relevant_role(title):
@@ -487,10 +492,7 @@ def fetch_recruitee_jobs(career_url):
             "date_posted": _parse_date_str(j.get("created_at", "") or j.get("published_at", "")),
         })
 
-    all_offers = data.get("offers", [])
-    fp = json.dumps(sorted(str(j.get("id", "")) for j in all_offers))
-    log.info("  📡 Recruitee API: %d total / %d matching", len(all_offers), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(all_offers, "Recruitee", len(jobs)), jobs
 
 
 def fetch_phenom_jobs(career_url):
@@ -501,17 +503,13 @@ def fetch_phenom_jobs(career_url):
     career page URL tells us the Phenom tenant domain.
     Returns (fingerprint_str | None, jobs_list).
     """
-    parsed   = urlparse(career_url)
-    qs       = parse_qs(parsed.query)
-    domain   = qs.get("domain", [parsed.hostname])[0]
-    api_url  = f"https://{parsed.hostname}/api/apply/v2/jobs"
-    params   = {"domain": domain, "start": 0, "num": 100, "sort_by": "relevance"}
-    try:
-        resp = requests.get(api_url, params=params, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Phenom API error (%s): %s", career_url, exc)
+    parsed  = urlparse(career_url)
+    domain  = parse_qs(parsed.query).get("domain", [parsed.hostname])[0]
+    api_url = f"https://{parsed.hostname}/api/apply/v2/jobs"
+    data    = _fetch_api_json(api_url, "Phenom", career_url,
+                              params={"domain": domain, "start": 0, "num": 100,
+                                      "sort_by": "relevance"})
+    if data is None:
         return None, []
 
     all_positions = data.get("positions", [])
@@ -530,9 +528,7 @@ def fetch_phenom_jobs(career_url):
             "date_posted": _parse_date_str(j.get("datePosted", "") or j.get("updatedAt", "")),
         })
 
-    fp = json.dumps(sorted(str(j.get("id", "")) for j in all_positions))
-    log.info("  📡 Phenom API: %d total / %d matching", len(all_positions), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(all_positions, "Phenom", len(jobs)), jobs
 
 
 def fetch_jobvite_jobs(career_url):
@@ -544,16 +540,12 @@ def fetch_jobvite_jobs(career_url):
              KraussMaffei (jobs.kraussmaffei.com), SES Sat (careers.ses.com).
     Returns (fingerprint_str | None, jobs_list).
     """
-    parsed  = urlparse(career_url)
-    api_url = f"https://{parsed.hostname}/api/get_job_list"
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Jobvite API error (%s): %s", career_url, exc)
+    api_url  = f"https://{urlparse(career_url).hostname}/api/get_job_list"
+    data     = _fetch_api_json(api_url, "Jobvite", career_url)
+    if data is None:
         return None, []
 
+    # Jobvite returns either {"jobs": [...]} or a bare list depending on version
     raw_jobs = data.get("jobs", data) if isinstance(data, dict) else data
     if not isinstance(raw_jobs, list):
         raw_jobs = []
@@ -562,11 +554,7 @@ def fetch_jobvite_jobs(career_url):
     for j in raw_jobs:
         title    = j.get("title", "")
         loc_data = j.get("location", {}) or {}
-        location = (
-            loc_data.get("city", "") or
-            j.get("city", "") or
-            "See posting"
-        )
+        location = loc_data.get("city", "") or j.get("city", "") or "See posting"
         country  = loc_data.get("country", "") or j.get("country", "")
         if location != "See posting" and country:
             location = f"{location}, {country}"
@@ -581,9 +569,7 @@ def fetch_jobvite_jobs(career_url):
             "date_posted": _parse_date_str(j.get("date", "") or j.get("datePosted", "")),
         })
 
-    fp = json.dumps(sorted(str(j.get("id", "")) for j in raw_jobs))
-    log.info("  📡 Jobvite API: %d total / %d matching", len(raw_jobs), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(raw_jobs, "Jobvite", len(jobs)), jobs
 
 
 def fetch_personio_jobs(career_url):
@@ -595,12 +581,8 @@ def fetch_personio_jobs(career_url):
     """
     parsed  = urlparse(career_url)
     api_url = f"https://{parsed.hostname}/json"
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("  ⚠  Personio API error (%s): %s", career_url, exc)
+    data    = _fetch_api_json(api_url, "Personio", career_url)
+    if data is None:
         return None, []
 
     raw_jobs = data if isinstance(data, list) else data.get("positions", [])
@@ -621,9 +603,7 @@ def fetch_personio_jobs(career_url):
             "date_posted": _parse_date_str(j.get("created_at", "")),
         })
 
-    fp = json.dumps(sorted(str(j.get("id", "")) for j in raw_jobs))
-    log.info("  📡 Personio API: %d total / %d matching", len(raw_jobs), len(jobs))
-    return fp, jobs
+    return _api_fingerprint(raw_jobs, "Personio", len(jobs)), jobs
 
 
 # ── Job extraction ─────────────────────────────────────────────────────────────
