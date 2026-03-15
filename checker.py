@@ -13,8 +13,9 @@ import hashlib
 import smtplib
 import csv
 import logging
+import time
 from datetime import datetime, date, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -113,6 +114,8 @@ AI_ENABLED          = _GEMINI_AVAILABLE and bool(GEMINI_API_KEY)
 TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED    = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+LINKEDIN_VALIDATE   = os.environ.get("LINKEDIN_VALIDATE", "true").lower() == "true"
+LINKEDIN_MAX_AGE    = int(os.environ.get("LINKEDIN_MAX_AGE_DAYS", "3"))  # days
 
 DB_COLUMNS = ["Date Recorded", "Date Posted", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
@@ -730,6 +733,80 @@ def send_telegram(jobs_by_company):
         log.warning("  ⚠  Telegram send failed: %s", exc)
 
 
+# ── LinkedIn age-check ────────────────────────────────────────────────────────
+#
+# After a job is found on a company's own career page we cross-check LinkedIn.
+# Logic:
+#   • NOT on LinkedIn          → brand new, include it
+#   • On LinkedIn, ≤ MAX days  → still fresh, include it
+#   • On LinkedIn, > MAX days  → already circulating, skip
+#   • Any error / LinkedIn 999 → fail open (always include)
+
+_LI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+def _linkedin_posted_date(job_title, company_name):
+    """Search LinkedIn for job_title + company_name.
+
+    Returns the posting date (date object) of the best matching result,
+    or None when not found / request blocked (caller must fail open).
+    """
+    query = f"{job_title} {company_name}"
+    url   = (
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobView"
+        f"?keywords={quote_plus(query)}&location=Munich%2C+Germany&start=0"
+    )
+    try:
+        resp = requests.get(url, headers=_LI_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            log.debug("  LinkedIn returned %d for '%s'", resp.status_code, job_title)
+            return None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        for card in soup.select(".base-card, .job-search-card"):
+            title_el   = card.select_one(".base-search-card__title")
+            company_el = card.select_one(".base-search-card__subtitle")
+            time_el    = card.select_one("time[datetime]")
+            if not (title_el and company_el and time_el):
+                continue
+            # Loose match: first 15 chars of title + first 10 of company name
+            if (ci(job_title[:15]) in ci(title_el.get_text()) and
+                    ci(company_name[:10]) in ci(company_el.get_text())):
+                try:
+                    return date.fromisoformat(time_el["datetime"][:10])
+                except (ValueError, KeyError):
+                    pass
+    except Exception as exc:
+        log.debug("  LinkedIn check error for '%s': %s", job_title, exc)
+    return None
+
+
+def linkedin_is_fresh(job_title, company_name):
+    """Return True if the job should be alerted (fresh or unseen on LinkedIn).
+
+    Returns False only when the job is confidently found on LinkedIn AND is
+    older than LINKEDIN_MAX_AGE days.  On any doubt, returns True (fail open).
+    """
+    if not LINKEDIN_VALIDATE:
+        return True
+    posted = _linkedin_posted_date(job_title, company_name)
+    if posted is None:
+        return True   # not on LinkedIn yet = brand new, or check failed = include
+    age = (date.today() - posted).days
+    if age > LINKEDIN_MAX_AGE:
+        log.info("  ⏭  Skipping '%s' — already on LinkedIn (%d days old)", job_title, age)
+        return False
+    return True
+
+
 # ── Email ──────────────────────────────────────────────────────────────────────
 
 def send_email(results, db_updated):
@@ -923,6 +1000,18 @@ def main():
         # Date filter: only alert on jobs posted today or yesterday.
         # Unknown date (None) is included — never silently drop a job we can't date.
         new_jobs = [j for j in new_to_known if is_recent(j.get("date_posted"))]
+
+        # LinkedIn validation: cross-check each job against LinkedIn.
+        # Jobs already circulating on LinkedIn for > LINKEDIN_MAX_AGE days are skipped.
+        # Not found on LinkedIn = brand new on the company site = include.
+        # Fails open on any network/parsing error.
+        if LINKEDIN_VALIDATE and new_jobs:
+            validated = []
+            for j in new_jobs:
+                if linkedin_is_fresh(j["title"], name):
+                    validated.append(j)
+                time.sleep(1)   # gentle throttle — avoid hammering LinkedIn
+            new_jobs = validated
 
         skipped = len(new_to_known) - len(new_jobs)
         log.info("  → %d matching / %d unseen / %d recent%s",

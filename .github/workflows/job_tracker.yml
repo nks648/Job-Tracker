@@ -49,6 +49,8 @@ jobs:
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}        # optional — enables AI contextual search
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}  # optional — instant mobile alerts
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}    # optional — your chat/user ID
+          LINKEDIN_VALIDATE:    "true"                             # set "false" to disable LinkedIn age-check
+          LINKEDIN_MAX_AGE_DAYS: "3"                              # skip jobs already on LinkedIn > N days
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python checker.py
 
