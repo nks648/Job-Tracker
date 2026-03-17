@@ -9,6 +9,7 @@ Sends alerts to multiple recipients
 import os
 import json
 import re
+import html as html_mod
 import hashlib
 import smtplib
 import csv
@@ -258,8 +259,11 @@ def extract_jobs(html, page_url):
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("⚠  State file unreadable (%s) — starting fresh baseline", exc)
     return {}
 
 def save_state(state):
@@ -305,13 +309,17 @@ def send_email(results, db_updated):
     job_rows = ""
     for r in results:
         for j in r["new_jobs"]:
+            company  = html_mod.escape(r["company"])
+            title    = html_mod.escape(j["title"])
+            location = html_mod.escape(j["location"])
+            job_url  = html_mod.escape(j["url"], quote=True)
             job_rows += (
                 f"<tr style='border-bottom:1px solid #f3f4f6'>"
-                f"<td style='padding:12px 14px 12px 0;font-weight:600;font-size:14px'>{r['company']}</td>"
-                f"<td style='padding:12px 14px 12px 0;font-size:14px'>{j['title']}</td>"
-                f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>{j['location']}</td>"
+                f"<td style='padding:12px 14px 12px 0;font-weight:600;font-size:14px'>{company}</td>"
+                f"<td style='padding:12px 14px 12px 0;font-size:14px'>{title}</td>"
+                f"<td style='padding:12px 14px 12px 0;color:#6b7280;font-size:13px'>{location}</td>"
                 f"<td style='padding:12px 0'>"
-                f"<a href='{j['url']}' style='background:#2563eb;color:#fff;padding:5px 14px;"
+                f"<a href='{job_url}' style='background:#2563eb;color:#fff;padding:5px 14px;"
                 f"border-radius:5px;text-decoration:none;font-size:13px;font-weight:600'>Apply →</a>"
                 f"</td></tr>"
             )
@@ -319,12 +327,14 @@ def send_email(results, db_updated):
     page_rows = ""
     for r in results:
         if r["page_changed"] and not r["new_jobs"]:
+            company     = html_mod.escape(r["company"])
+            company_url = html_mod.escape(r["company_url"], quote=True)
             page_rows += (
                 f"<tr style='border-bottom:1px solid #f3f4f6'>"
-                f"<td style='padding:10px 14px 10px 0;font-weight:600'>{r['company']}</td>"
+                f"<td style='padding:10px 14px 10px 0;font-weight:600'>{company}</td>"
                 f"<td colspan='2' style='padding:10px 14px 10px 0;color:#6b7280;font-size:13px'>"
                 f"Page updated — likely JS-rendered, check manually</td>"
-                f"<td><a href='{r['company_url']}' style='color:#2563eb;font-size:13px'>Visit →</a></td>"
+                f"<td><a href='{company_url}' style='color:#2563eb;font-size:13px'>Visit →</a></td>"
                 f"</tr>"
             )
 
@@ -390,10 +400,17 @@ def send_email(results, db_updated):
             msg.attach(part)
         log.info("Attached jobs_database.csv to email")
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(GMAIL_USER, GMAIL_PASSWORD)
-        s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
-    log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(GMAIL_USER, GMAIL_PASSWORD)
+            s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())
+        log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
+    except smtplib.SMTPRecipientsRefused as exc:
+        log.error("✉  Delivery failed for one or more recipients: %s", exc.recipients)
+    except smtplib.SMTPAuthenticationError:
+        log.error("✉  SMTP authentication failed — check GMAIL_USER / GMAIL_APP_PASSWORD")
+    except Exception as exc:
+        log.error("✉  Failed to send email: %s", exc)
 
 # ── Posting-date helpers ───────────────────────────────────────────────────────
 
@@ -635,7 +652,7 @@ def fetch_workday_jobs(url):
             data = resp.json()
         except Exception as exc:
             log.warning("  ⚠  Workday API error (%s): %s", url, exc)
-            return None
+            break   # return whatever we fetched so far rather than discarding it
         postings = data.get("jobPostings", [])
         total    = data.get("total", 0)
         for posting in postings:
