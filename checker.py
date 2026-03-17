@@ -573,9 +573,9 @@ def fetch_recruitee_jobs(url):
 
 def fetch_personio_jobs(url):
     """Fetch jobs from Personio ATS via its public JSON API."""
-    parsed    = urlparse(url)
-    subdomain = parsed.netloc.split(".")[0]
-    api_url   = f"https://{parsed.netloc}/api/jobs"
+    parsed  = urlparse(url)
+    base    = f"{parsed.scheme}://{parsed.netloc}"
+    api_url = f"{base}/api/jobs"
     try:
         resp = requests.get(api_url, headers=HEADERS, timeout=25)
         resp.raise_for_status()
@@ -585,13 +585,13 @@ def fetch_personio_jobs(url):
         return None
     jobs = []
     for job in data:
-        title    = job.get("name", "") or ""
-        # location may be nested under office or at top level
-        office   = (job.get("office") or {})
-        location = office.get("name", "") or job.get("office", "") or ""
-        if isinstance(location, dict):
-            location = location.get("name", "")
-        job_url  = job.get("url", url)
+        title  = job.get("name", "") or ""
+        # office can be a dict {"name": "Munich"} or a plain string
+        office = job.get("office") or ""
+        location = (office.get("name", "") if isinstance(office, dict) else str(office)).strip()
+        # Build direct job link from id; fall back to career page
+        job_id  = job.get("id")
+        job_url = f"{base}/job/{job_id}" if job_id else url
         if not is_relevant_role(title):
             continue
         if location and not is_relevant_location(location):
