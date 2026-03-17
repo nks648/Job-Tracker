@@ -363,6 +363,96 @@ def send_email(results, db_updated):
         s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
     log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
 
+# ── ATS API fetchers ───────────────────────────────────────────────────────────
+
+def fetch_greenhouse_jobs(url):
+    """Fetch jobs from Greenhouse ATS via its public JSON API."""
+    parsed = urlparse(url)
+    slug   = parsed.path.strip("/")
+    if "eu.greenhouse.io" in url:
+        api_url = f"https://job-boards.eu.greenhouse.io/v1/boards/{slug}/jobs"
+    else:
+        api_url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Greenhouse API error (%s): %s", url, exc)
+        return None
+    jobs = []
+    for job in data.get("jobs", []):
+        title    = job.get("title", "")
+        location = (job.get("location") or {}).get("name", "") or ""
+        job_url  = job.get("absolute_url", url)
+        if not is_relevant_role(title):
+            continue
+        if location and not is_relevant_location(location):
+            continue
+        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+    return jobs
+
+def fetch_lever_jobs(url):
+    """Fetch jobs from Lever ATS via its public JSON API."""
+    parsed  = urlparse(url)
+    slug    = parsed.path.strip("/")
+    api_url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Lever API error (%s): %s", url, exc)
+        return None
+    jobs = []
+    for posting in data:
+        title      = posting.get("text", "")
+        categories = posting.get("categories", {})
+        location   = categories.get("location", "") or ""
+        job_url    = posting.get("hostedUrl", url)
+        if not is_relevant_role(title):
+            continue
+        if location and not is_relevant_location(location):
+            continue
+        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+    return jobs
+
+def fetch_recruitee_jobs(url):
+    """Fetch jobs from Recruitee ATS via its public JSON API."""
+    parsed    = urlparse(url)
+    subdomain = parsed.netloc.split(".")[0]
+    api_url   = f"https://{subdomain}.recruitee.com/api/offers/"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Recruitee API error (%s): %s", url, exc)
+        return None
+    jobs = []
+    for offer in data.get("offers", []):
+        title    = offer.get("title", "")
+        location = offer.get("location", "") or offer.get("city", "") or ""
+        job_url  = offer.get("careers_url", url)
+        if not is_relevant_role(title):
+            continue
+        if location and not is_relevant_location(location):
+            continue
+        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+    return jobs
+
+ATS_FETCHERS = {
+    "greenhouse.io": fetch_greenhouse_jobs,
+    "lever.co":      fetch_lever_jobs,
+    "recruitee.com": fetch_recruitee_jobs,
+}
+
+def detect_ats_fetcher(url):
+    for domain, fetcher in ATS_FETCHERS.items():
+        if domain in url:
+            return fetcher
+    return None
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -377,21 +467,36 @@ def main():
         name, url = company["name"], company["url"]
         log.info("Checking: %s", name)
 
-        html = fetch(url)
-        if not html:
-            continue
+        ats_fetcher = detect_ats_fetcher(url)
+        if ats_fetcher:
+            # ── API path: structured data, no fingerprint needed ───────────────
+            found     = ats_fetcher(url)
+            if found is None:
+                continue
+            known     = set(state.get(f"{name}__jobs", []))
+            first_run = f"{name}__jobs" not in state
+            new_jobs  = [] if first_run else [j for j in found if ci(j["title"]) not in known]
+            changed   = False
+            log.info("  [API] → %d matching / %d new", len(found), len(new_jobs))
+        else:
+            # ── HTML scraping path: fingerprint-based change detection ─────────
+            html = fetch(url)
+            if not html:
+                continue
+            fp        = page_fingerprint(html)
+            old_fp    = state.get(f"{name}__hash")
+            known     = set(state.get(f"{name}__jobs", []))
+            first_run = old_fp is None
+            changed   = (not first_run) and (fp != old_fp)
+            found     = extract_jobs(html, url)
+            new_jobs  = [j for j in found if ci(j["title"]) not in known] if changed else []
+            log.info("  → %d matching / %d new", len(found), len(new_jobs))
+            state[f"{name}__hash"] = fp
+            # Log page changes with no parseable jobs (JS-rendered)
+            if not first_run and changed and not found:
+                append_page_change_to_db(name, url, existing_db)
 
-        fp        = page_fingerprint(html)
-        old_fp    = state.get(f"{name}__hash")
-        known     = set(state.get(f"{name}__jobs", []))
-        first_run = old_fp is None
-        changed   = (not first_run) and (fp != old_fp)
-
-        found    = extract_jobs(html, url)
-        new_jobs = [j for j in found if ci(j["title"]) not in known] if changed else []
-        log.info("  → %d matching / %d new", len(found), len(new_jobs))
-
-        # Save new jobs to DB
+        # ── Common: save new jobs to DB ────────────────────────────────────────
         for j in new_jobs:
             db_key = (name.lower(), ci(j["title"]))
             if db_key not in existing_db:
@@ -406,10 +511,6 @@ def main():
                 })
                 existing_db.add(db_key)
 
-        # Log page changes with no parseable jobs (truly JS-rendered — nothing extracted)
-        if not first_run and changed and not found:
-            append_page_change_to_db(name, url, existing_db)
-
         if first_run:
             log.info("  → First run: baseline saved")
         elif new_jobs:
@@ -417,7 +518,6 @@ def main():
         elif changed:
             log.info("  📄 Page changed, no parseable new jobs")
 
-        state[f"{name}__hash"] = fp
         state[f"{name}__jobs"] = [ci(j["title"]) for j in found]
 
         if not first_run and (new_jobs or changed):
