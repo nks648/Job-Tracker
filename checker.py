@@ -14,7 +14,7 @@ import smtplib
 import csv
 import logging
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -441,10 +441,62 @@ def fetch_recruitee_jobs(url):
         jobs.append({"title": title, "location": location or "See posting", "url": job_url})
     return jobs
 
+def _workday_api_url(url):
+    """Parse a Workday career page URL into (api_url, applied_facets)."""
+    parsed = urlparse(url)
+    tenant = parsed.netloc.split(".")[0]
+    # Path may have an optional locale prefix like /fr-FR/ or /en-US/
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if path_parts and re.match(r'^[a-z]{2}[-_][A-Z]{2}$', path_parts[0]):
+        path_parts = path_parts[1:]
+    board   = path_parts[0] if path_parts else "careers"
+    api_url = f"https://{parsed.netloc}/wday/cxs/{tenant}/{board}/jobs"
+    # Preserve location facets already encoded in the URL query string
+    facets  = {k: v for k, v in parse_qs(parsed.query).items()}
+    return api_url, facets
+
+def fetch_workday_jobs(url):
+    """Fetch jobs from Workday ATS via its internal JSON API."""
+    api_url, facets = _workday_api_url(url)
+    parsed = urlparse(url)
+    base   = f"{parsed.scheme}://{parsed.netloc}"
+    jobs, offset, limit = [], 0, 20
+    while True:
+        payload = {"appliedFacets": facets, "limit": limit, "offset": offset, "searchText": ""}
+        try:
+            resp = requests.post(
+                api_url,
+                json=payload,
+                headers={**HEADERS, "Content-Type": "application/json"},
+                timeout=25,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("  ⚠  Workday API error (%s): %s", url, exc)
+            return None
+        postings = data.get("jobPostings", [])
+        total    = data.get("total", 0)
+        for posting in postings:
+            title    = posting.get("title", "")
+            location = posting.get("locationsText", "") or ""
+            ext_path = posting.get("externalPath", "")
+            job_url  = (base + ext_path) if ext_path else url
+            if not is_relevant_role(title):
+                continue
+            if location and not is_relevant_location(location):
+                continue
+            jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+        offset += len(postings)
+        if offset >= total or not postings:
+            break
+    return jobs
+
 ATS_FETCHERS = {
-    "greenhouse.io": fetch_greenhouse_jobs,
-    "lever.co":      fetch_lever_jobs,
-    "recruitee.com": fetch_recruitee_jobs,
+    "greenhouse.io":     fetch_greenhouse_jobs,
+    "lever.co":          fetch_lever_jobs,
+    "recruitee.com":     fetch_recruitee_jobs,
+    "myworkdayjobs.com": fetch_workday_jobs,
 }
 
 def detect_ats_fetcher(url):
