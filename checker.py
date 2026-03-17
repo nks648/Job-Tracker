@@ -13,7 +13,7 @@ import hashlib
 import smtplib
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, parse_qs
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -101,9 +101,10 @@ GMAIL_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 # e.g. "nagarjun@gmail.com,friend@gmail.com"
 NOTIFY_EMAILS  = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
 STATE_FILE     = os.environ.get("STATE_FILE", "job_state.json")
-DB_FILE        = "jobs_database.csv"
+DB_FILE           = "jobs_database.csv"
+MAX_JOB_AGE_DAYS  = 3   # only alert on jobs posted within this many days
 
-DB_COLUMNS = ["Date Recorded", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
+DB_COLUMNS = ["Date Recorded", "Date Posted", "Company", "Job Title", "Location", "Job URL", "Career Page", "Status"]
 
 HEADERS = {
     "User-Agent": (
@@ -143,12 +144,24 @@ def extract_location_hint(text):
 # ── CSV Database ───────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create CSV with headers if it doesn't exist."""
+    """Create CSV with headers if it doesn't exist; migrate schema if needed."""
     if not os.path.exists(DB_FILE):
         with open(DB_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
-            writer.writeheader()
+            csv.DictWriter(f, fieldnames=DB_COLUMNS).writeheader()
         log.info("Created new jobs_database.csv")
+        return
+    # Migrate: rewrite header + rows if a column is missing
+    with open(DB_FILE, newline="", encoding="utf-8") as f:
+        reader     = csv.DictReader(f)
+        existing   = set(reader.fieldnames or [])
+        old_rows   = list(reader) if not existing.issuperset(DB_COLUMNS) else None
+    if old_rows is not None:
+        with open(DB_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=DB_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in old_rows:
+                writer.writerow({col: row.get(col, "") for col in DB_COLUMNS})
+        log.info("Migrated jobs_database.csv to updated schema")
 
 def load_db():
     """Load existing records as a set of (company, title) tuples to avoid duplicates."""
@@ -364,6 +377,60 @@ def send_email(results, db_updated):
         s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
     log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
 
+# ── Posting-date helpers ───────────────────────────────────────────────────────
+
+_DATE_FMTS = ("%d-%b-%Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")
+
+def parse_posted_date(raw):
+    """Return datetime.date from various date/timestamp strings, or None."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    for fmt in _DATE_FMTS:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def _parse_workday_posted_on(text):
+    """Convert Workday's relative 'Posted N Days Ago' strings to a date."""
+    if not text:
+        return None
+    t = text.lower()
+    today = datetime.today().date()
+    if "today" in t:
+        return today
+    if "yesterday" in t:
+        return today - timedelta(days=1)
+    m = re.search(r"(\d+)\+?\s*day", t)
+    if m:
+        return today - timedelta(days=int(m.group(1)))
+    return None
+
+def fetch_posting_date(job_url):
+    """Fetch a job detail page and extract its posting date (best-effort)."""
+    html = fetch(job_url)
+    if not html:
+        return None
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    # "Posted since: 16-Mar-2026"  (Siemens / Phenom)
+    m = re.search(r"posted\s+since[:\s]+(\d{1,2}-\w{3}-\d{4})", text, re.IGNORECASE)
+    if m:
+        return parse_posted_date(m.group(1))
+    # ISO date near "posted"
+    m = re.search(r"posted[^:]*?:\s*(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+    if m:
+        return parse_posted_date(m.group(1))
+    return None
+
+def is_recent(job):
+    """Return True if the job was posted within MAX_JOB_AGE_DAYS (or date unknown)."""
+    d = job.get("posted_date")
+    if d is None:
+        return True   # no date available — don't discard
+    return (datetime.today().date() - d).days <= MAX_JOB_AGE_DAYS
+
 # ── ATS API fetchers ───────────────────────────────────────────────────────────
 
 def fetch_greenhouse_jobs(url):
@@ -390,7 +457,10 @@ def fetch_greenhouse_jobs(url):
             continue
         if location and not is_relevant_location(location):
             continue
-        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+        jobs.append({
+            "title": title, "location": location or "See posting", "url": job_url,
+            "posted_date": parse_posted_date(job.get("first_published_at", "")),
+        })
     return jobs
 
 def fetch_lever_jobs(url):
@@ -415,7 +485,12 @@ def fetch_lever_jobs(url):
             continue
         if location and not is_relevant_location(location):
             continue
-        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+        created_ms  = posting.get("createdAt")
+        posted_date = (datetime.fromtimestamp(created_ms / 1000).date() if created_ms else None)
+        jobs.append({
+            "title": title, "location": location or "See posting", "url": job_url,
+            "posted_date": posted_date,
+        })
     return jobs
 
 def fetch_recruitee_jobs(url):
@@ -439,7 +514,10 @@ def fetch_recruitee_jobs(url):
             continue
         if location and not is_relevant_location(location):
             continue
-        jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+        jobs.append({
+            "title": title, "location": location or "See posting", "url": job_url,
+            "posted_date": parse_posted_date(offer.get("published_at", "")),
+        })
     return jobs
 
 def _workday_api_url(url):
@@ -487,7 +565,10 @@ def fetch_workday_jobs(url):
                 continue
             if location and not is_relevant_location(location):
                 continue
-            jobs.append({"title": title, "location": location or "See posting", "url": job_url})
+            jobs.append({
+                "title": title, "location": location or "See posting", "url": job_url,
+                "posted_date": _parse_workday_posted_on(posting.get("postedOn", "")),
+            })
         offset += len(postings)
         if offset >= total or not postings:
             break
@@ -549,12 +630,26 @@ def main():
             if not first_run and changed and not found:
                 append_page_change_to_db(name, url, existing_db)
 
-        # ── Common: save new jobs to DB ────────────────────────────────────────
-        for j in new_jobs:
+        # ── Common: enrich with posting date, apply recency filter, save to DB ──
+        # For HTML-scraped companies, fetch the detail page for each new job
+        # to extract the "Posted since" date.
+        if not ats_fetcher:
+            for j in new_jobs:
+                if j.get("posted_date") is None and j["url"] != url:
+                    j["posted_date"] = fetch_posting_date(j["url"])
+
+        recent_jobs = [j for j in new_jobs if is_recent(j)]
+        skipped     = len(new_jobs) - len(recent_jobs)
+        if skipped:
+            log.info("  ⏩ Skipped %d job(s) older than %d days", skipped, MAX_JOB_AGE_DAYS)
+
+        for j in recent_jobs:
             db_key = (name.lower(), ci(j["title"]))
             if db_key not in existing_db:
+                posted_str = j["posted_date"].isoformat() if j.get("posted_date") else ""
                 new_db_rows.append({
                     "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+                    "Date Posted":   posted_str,
                     "Company":       name,
                     "Job Title":     j["title"],
                     "Location":      j["location"],
@@ -566,18 +661,18 @@ def main():
 
         if first_run:
             log.info("  → First run: baseline saved")
-        elif new_jobs:
-            log.info("  🆕 New: %s", [j["title"] for j in new_jobs])
+        elif recent_jobs:
+            log.info("  🆕 New: %s", [j["title"] for j in recent_jobs])
         elif changed:
             log.info("  📄 Page changed, no parseable new jobs")
 
         state[f"{name}__jobs"] = [ci(j["title"]) for j in found]
 
-        if not first_run and (new_jobs or changed):
+        if not first_run and (recent_jobs or changed):
             results.append({
                 "company":      name,
                 "company_url":  url,
-                "new_jobs":     new_jobs,
+                "new_jobs":     recent_jobs,
                 "page_changed": changed,
             })
 
