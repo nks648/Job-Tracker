@@ -231,7 +231,8 @@ def extract_jobs(html, page_url):
         ctx = parent.get_text(" ", strip=True) if parent else ""
         location = extract_location_hint(ctx) or "See posting"
         if location != "See posting" and not is_relevant_location(location): continue
-        jobs.append({"title": title, "location": location, "url": abs_url(a["href"])})
+        jobs.append({"title": title, "location": location, "url": abs_url(a["href"]),
+                     "posted_date": _parse_workday_posted_on(ctx)})
 
     if not jobs:
         for tag in soup.find_all(["li", "div", "article"]):
@@ -242,7 +243,8 @@ def extract_jobs(html, page_url):
             title_text = inner.get_text(strip=True) if inner else text[:100]
             location   = extract_location_hint(text) or "See posting"
             jobs.append({"title": title_text, "location": location,
-                         "url": abs_url(inner["href"] if inner else None)})
+                         "url": abs_url(inner["href"] if inner else None),
+                         "posted_date": _parse_workday_posted_on(text)})
 
     seen, unique = set(), []
     for j in jobs:
