@@ -20,6 +20,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
+import time
 import requests
 from bs4 import BeautifulSoup
 
@@ -34,6 +35,9 @@ log = logging.getLogger(__name__)
 ROLE_KEYWORDS = [
     "project manager", "program manager", "programme manager",
     "projektmanager", "projektleiter", "programm manager",
+    "project lead", "project leader", "projektleitung",
+    "delivery manager", "technical project manager", "technical program manager",
+    "pmo manager", "it project manager",
 ]
 
 SENIORITY_EXCLUDE = [
@@ -70,7 +74,7 @@ COMPANIES = [
     {"name": "AMD Munich",          "url": "https://careers.amd.com/careers-home/jobs?stretchUnit=MILES&stretch=10&location=Munich,%20Germany&woe=7&regionCode=DE"},
     {"name": "Applied Materials",   "url": "https://careers.appliedmaterials.com/careers?domain=appliedmaterials.com&triggerGoButton=false&start=0&pid=790303658171&sort_by=timestamp&filter_country=Germany"},
     {"name": "Infineon",            "url": "https://jobs.infineon.com/careers?query=Project%20Management&location=Munich%2C%20BY%2C%20Germany&pid=563808959485350&domain=infineon.com&sort_by=relevance"},
-    {"name": "Siemens",             "url": "https://jobs.siemens.com/en_US/externaljobs/SearchJobs/?42414=%5B812132%5D&42414_format=17570&42415=%5B813141%5D&42415_format=17571&listFilterMode=1&folderRecordsPerPage=6"},
+    {"name": "Siemens",             "url": "https://jobs.siemens.com/en_US/externaljobs/SearchJobs/?42414=%5B812132%5D&42414_format=17570&42415=%5B813141%5D&42415_format=17571&listFilterMode=1&folderRecordsPerPage=20"},
     {"name": "Siemens Energy",      "url": "https://jobs.siemens-energy.com/en_US/jobs/Jobs/?29454=964485&29454_format=11381&29455=964685&29455_format=11382&listFilterMode=1&folderRecordsPerPage=20"},
     {"name": "Rheinmetall",         "url": "https://www.rheinmetall.com/en/career/vacancies?9dc11c304b4c06c2f71c48cc6574e7e5filter=%257B%2522countries%2522%253A%255B%2522Germany%2522%255D%252C%2522cities%2522%253A%255B%2522M%25C3%25BCnchen%2522%255D%257D"},
     {"name": "Bosch",               "url": "https://jobs.bosch.com/en?pages=1&country=de&location=M%C3%BCnchen+-+Mitte#"},
@@ -92,6 +96,12 @@ COMPANIES = [
     {"name": "Tytan",               "url": "https://tytantechnologiesgmbh.recruitee.com"},
     {"name": "Hypersonica",         "url": "https://jobs.lever.co/hypersonica-prod?location=Munich%20or%20Remote"},
     {"name": "Reverion",            "url": "https://reverion.jobs.personio.de/?language=en"},
+    {"name": "Isar Aerospace",      "url": "https://www.isarspace.com/careers#jobs"},
+    {"name": "Rohde & Schwarz",     "url": "https://www.rohde-schwarz.com/us/jobs/search-jobs_109605.html?filters=countries_Germany"},
+    {"name": "BMW",                 "url": "https://www.bmwgroup.jobs/de/en/jobfinder.html?location=munich&department=project-management"},
+    {"name": "Munich Re",           "url": "https://www.munichre.com/en/company/careers/job-opportunities.html?location=munich"},
+    {"name": "Linde",               "url": "https://jobs.linde.com/en/jobs?country=Germany&city=Pullach"},
+    {"name": "MAN Energy Solutions","url": "https://www.man-es.com/company/careers/job-offerings?location=Germany"},
 ]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -255,13 +265,17 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 def fetch(url):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as exc:
-        log.warning("  ⚠  Could not fetch %s: %s", url, exc)
-        return None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 1s, 2s
+            else:
+                log.warning("  ⚠  Could not fetch %s: %s", url, exc)
+    return None
 
 def page_fingerprint(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -275,12 +289,14 @@ def page_fingerprint(html):
 def send_email(results, db_updated):
     total_jobs   = sum(len(r["new_jobs"]) for r in results)
     page_changes = sum(1 for r in results if r["page_changed"] and not r["new_jobs"])
-    date_str     = datetime.today().strftime("%d %b %Y")
+    now          = datetime.today()
+    date_str     = now.strftime("%d %b %Y")
+    time_str     = now.strftime("%H:%M")
 
     subject = (
         f"🚨 Job Alert: {total_jobs} new role(s) found"
         + (f" + {page_changes} page change(s)" if page_changes else "")
-        + f" — {date_str}"
+        + f" — {date_str} {time_str}"
     )
 
     # HTML job rows
@@ -467,7 +483,11 @@ def fetch_lever_jobs(url):
     """Fetch jobs from Lever ATS via its public JSON API."""
     parsed  = urlparse(url)
     slug    = parsed.path.strip("/")
+    qs      = parse_qs(parsed.query)
+    location_param = qs.get("location", [None])[0]
     api_url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    if location_param:
+        api_url += f"&location={requests.utils.quote(location_param)}"
     try:
         resp = requests.get(api_url, headers=HEADERS, timeout=25)
         resp.raise_for_status()
@@ -682,9 +702,12 @@ def main():
 
     save_state(state)
 
-    if results:
+    has_new_jobs = any(r["new_jobs"] for r in results)
+    if has_new_jobs:
         log.info("Sending email to %d recipient(s)…", len(NOTIFY_EMAILS))
         send_email(results, db_updated=bool(new_db_rows))
+    elif results:
+        log.info("Only page changes detected — skipping email (already logged to CSV).")
     else:
         log.info("No new matching roles found.")
 
