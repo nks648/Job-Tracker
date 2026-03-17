@@ -99,8 +99,10 @@ GMAIL_USER     = os.environ["GMAIL_USER"]
 GMAIL_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 # Multiple recipients: comma-separated in the secret
 # e.g. "nagarjun@gmail.com,friend@gmail.com"
-NOTIFY_EMAILS  = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
-STATE_FILE     = os.environ.get("STATE_FILE", "job_state.json")
+NOTIFY_EMAILS    = [e.strip() for e in os.environ.get("NOTIFY_EMAIL", GMAIL_USER).split(",")]
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+STATE_FILE       = os.environ.get("STATE_FILE", "job_state.json")
 DB_FILE           = "jobs_database.csv"
 MAX_JOB_AGE_DAYS  = 3   # only alert on jobs posted within this many days
 
@@ -376,6 +378,38 @@ def send_email(results, db_updated):
         s.login(GMAIL_USER, GMAIL_PASSWORD)
         s.sendmail(GMAIL_USER, NOTIFY_EMAILS, msg.as_string())  # ← send to all
     log.info("✉  Email sent to: %s", ", ".join(NOTIFY_EMAILS))
+
+# ── Telegram notification ───────────────────────────────────────────────────────
+
+def send_telegram(results):
+    """Send an instant Telegram push notification for new jobs."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    total = sum(len(r["new_jobs"]) for r in results)
+    lines = [f"🚨 <b>{total} new job(s) found</b>"]
+    for r in results:
+        for j in r["new_jobs"]:
+            date_tag = (f" · {j['posted_date'].strftime('%d %b')}"
+                        if j.get("posted_date") else "")
+            lines.append(
+                f"\n<b>{r['company']}</b>{date_tag}\n"
+                f"{j['title']} — {j['location']}\n"
+                f"<a href='{j['url']}'>Apply →</a>"
+            )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":                  TELEGRAM_CHAT_ID,
+                "text":                     "\n".join(lines),
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        ).raise_for_status()
+        log.info("📱 Telegram notification sent")
+    except Exception as exc:
+        log.warning("  ⚠  Telegram notification failed: %s", exc)
 
 # ── Posting-date helpers ───────────────────────────────────────────────────────
 
@@ -683,10 +717,11 @@ def main():
     save_state(state)
 
     if results:
-        log.info("Sending email to %d recipient(s)…", len(NOTIFY_EMAILS))
+        log.info("Sending notifications…")
+        send_telegram(results)
         send_email(results, db_updated=bool(new_db_rows))
     else:
-        log.info("No new matching roles today.")
+        log.info("No new matching roles found.")
 
     log.info("── Done ──")
 
