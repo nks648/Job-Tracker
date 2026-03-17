@@ -133,7 +133,7 @@ def is_relevant_location(loc_text):
 
 def extract_location_hint(text):
     for kw in LOCATION_KEYWORDS:
-        pattern = re.compile(rf"\b{re.escape(kw)}\b[^\n,|•·]{0,40}", re.IGNORECASE)
+        pattern = re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)[^\n,|•·]{{0,40}}", re.IGNORECASE)
         m = pattern.search(text)
         if m:
             return m.group(0).strip()[:60]
@@ -385,7 +385,7 @@ def main():
         changed   = (not first_run) and (fp != old_fp)
 
         found    = extract_jobs(html, url)
-        new_jobs = [j for j in found if ci(j["title"]) not in known]
+        new_jobs = [j for j in found if ci(j["title"]) not in known] if changed else []
         log.info("  → %d matching / %d new", len(found), len(new_jobs))
 
         # Save new jobs to DB
@@ -415,7 +415,7 @@ def main():
             log.info("  📄 Page changed, no parseable new jobs")
 
         state[f"{name}__hash"] = fp
-        state[f"{name}__jobs"] = list(known | {ci(j["title"]) for j in found})
+        state[f"{name}__jobs"] = [ci(j["title"]) for j in found]
 
         if not first_run and (new_jobs or changed):
             results.append({
