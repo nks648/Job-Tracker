@@ -14,7 +14,7 @@ import smtplib
 import csv
 import logging
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -169,12 +169,17 @@ def append_to_db(records):
             writer.writerow(r)
     log.info("Appended %d new record(s) to jobs_database.csv", len(records))
 
-def append_page_change_to_db(company, career_url):
-    """Log a page change (JS-rendered, manual check needed)."""
+def append_page_change_to_db(company, career_url, existing_db):
+    """Log a page change (JS-rendered, manual check needed). One row per company per day."""
+    today = datetime.today().strftime("%Y-%m-%d")
+    db_key = (company.lower(), f"⚠️ page changed — check manually ({today})")
+    if db_key in existing_db:
+        return
+    existing_db.add(db_key)
     with open(DB_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
         writer.writerow({
-            "Date Recorded": datetime.today().strftime("%Y-%m-%d"),
+            "Date Recorded": today,
             "Company":       company,
             "Job Title":     "⚠️ Page changed — check manually",
             "Location":      "Unknown (JS-rendered)",
@@ -192,9 +197,7 @@ def extract_jobs(html, page_url):
 
     def abs_url(href):
         if not href: return page_url
-        if href.startswith("http"): return href
-        if href.startswith("/"): return f"{base.scheme}://{base.netloc}{href}"
-        return page_url
+        return urljoin(page_url, href)
 
     for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
@@ -403,9 +406,9 @@ def main():
                 })
                 existing_db.add(db_key)
 
-        # Log page changes with no parseable jobs
-        if not first_run and changed and not new_jobs:
-            append_page_change_to_db(name, url)
+        # Log page changes with no parseable jobs (truly JS-rendered — nothing extracted)
+        if not first_run and changed and not found:
+            append_page_change_to_db(name, url, existing_db)
 
         if first_run:
             log.info("  → First run: baseline saved")
