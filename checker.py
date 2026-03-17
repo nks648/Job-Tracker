@@ -62,7 +62,7 @@ LOCATION_KEYWORDS = [
 COMPANIES = [
     {"name": "OHB AG",             "url": "https://career-ohb.csod.com/ux/ats/careersite/4/home?c=career-ohb&cfdd%5B0%5D%5Bid%5D=16&cfdd%5B0%5D%5Boptions%5D%5B0%5D=29&lq=Munich%252C%2520Germany&pl=ChIJ2V-Mo_l1nkcRfZixfUq4DAE&lang=en-GB"},
     {"name": "Ariane Group",        "url": "https://arianegroup.wd3.myworkdayjobs.com/fr-FR/EXTERNALALL?locations=a18ef726d665016eab2a92b8fa1c0dbb"},
-    {"name": "GE Aerospace",        "url": "https://careers.geaerospace.com/global/en/search-results"},
+    {"name": "GE Aerospace",        "url": "https://careers.geaerospace.com/global/en/search-results?keywords=project+manager&location=Munich%2C+Germany&locationRadius=50mi"},
     {"name": "MTU Aerospace",       "url": "https://www.mtu.de/careers/online-job-market/"},
     {"name": "Mynaric",             "url": "https://mynaric.com/careers/all-open-positions/"},
     {"name": "Marvel Fusion",       "url": "https://job-boards.eu.greenhouse.io/marvelfusion"},
@@ -78,13 +78,13 @@ COMPANIES = [
     {"name": "Siemens Energy",      "url": "https://jobs.siemens-energy.com/en_US/jobs/Jobs/?29454=964485&29454_format=11381&29455=964685&29455_format=11382&listFilterMode=1&folderRecordsPerPage=20"},
     {"name": "Rheinmetall",         "url": "https://www.rheinmetall.com/en/career/vacancies?9dc11c304b4c06c2f71c48cc6574e7e5filter=%257B%2522countries%2522%253A%255B%2522Germany%2522%255D%252C%2522cities%2522%253A%255B%2522M%25C3%25BCnchen%2522%255D%257D"},
     {"name": "Bosch",               "url": "https://jobs.bosch.com/en?pages=1&country=de&location=M%C3%BCnchen+-+Mitte#"},
-    {"name": "KNDS",                "url": "https://jobs.knds.de/content/search/?locale=de_DE&currentPage=1&pageSize=12&addresses%252Fname=M%C3%BCnchen"},
+    {"name": "KNDS",                "url": "https://jobs.knds.de/content/search/?locale=de_DE&currentPage=1&pageSize=50&addresses%252Fname=M%C3%BCnchen"},
     {"name": "Avilus",              "url": "https://www.avilus.com/career"},
     {"name": "MBDA",                "url": "https://www.mbda-careers.de/ema/?_locations%5B%5D=Ottobrunn&_order=ASC&_page=1"},
     {"name": "KraussMaffei",        "url": "https://jobs.kraussmaffei.com/search/?createNewAlert=false&q=&locationsearch=Parsdorf"},
     {"name": "Puma",                "url": "https://about.puma.com/en/careers/job-openings?area=all&location=441"},
     {"name": "Huber+Suhner",        "url": "https://recruiting.hubersuhner.com/Jobs/All"},
-    {"name": "SAP AG",              "url": "https://jobs.sap.com/search/?createNewAlert=false&q=&locationsearch=&optionsFacetsDD_country=DE"},
+    {"name": "SAP AG",              "url": "https://jobs.sap.com/search/?createNewAlert=false&q=project+manager&locationsearch=Munich&optionsFacetsDD_country=DE"},
     {"name": "Bundesagentur",       "url": "https://www.arbeitsagentur.de/jobsuche/suche?angebotsart=1&wo=M%C3%BCnchen&umkreis=25&veroeffentlichtseit=0&was=Projektmanager%252Fin"},
     {"name": "Renk",                "url": "https://www.renk.com/en/career/job-opportunities/opportunities-in-europe"},
     {"name": "Spire Defense",       "url": "https://spire.com/careers/job-openings/?location=munich"},
@@ -232,7 +232,7 @@ def extract_jobs(html, page_url):
         location = extract_location_hint(ctx) or "See posting"
         if location != "See posting" and not is_relevant_location(location): continue
         jobs.append({"title": title, "location": location, "url": abs_url(a["href"]),
-                     "posted_date": _parse_workday_posted_on(ctx)})
+                     "posted_date": _parse_posted_ago(ctx)})
 
     if not jobs:
         for tag in soup.find_all(["li", "div", "article"]):
@@ -244,7 +244,7 @@ def extract_jobs(html, page_url):
             location   = extract_location_hint(text) or "See posting"
             jobs.append({"title": title_text, "location": location,
                          "url": abs_url(inner["href"] if inner else None),
-                         "posted_date": _parse_workday_posted_on(text)})
+                         "posted_date": _parse_posted_ago(text)})
 
     seen, unique = set(), []
     for j in jobs:
@@ -412,7 +412,12 @@ def parse_posted_date(raw):
     return None
 
 def _parse_workday_posted_on(text):
-    """Convert Workday's relative 'Posted N Days Ago' strings to a date."""
+    """Convert Workday's relative 'Posted N Days Ago' strings to a date.
+
+    Expects a clean, isolated string (e.g. the `postedOn` field from the
+    Workday API).  Do NOT pass a full job-card blob — use _parse_posted_ago
+    instead for untrusted freeform context text.
+    """
     if not text:
         return None
     t = text.lower()
@@ -422,6 +427,30 @@ def _parse_workday_posted_on(text):
     if "yesterday" in t:
         return today - timedelta(days=1)
     m = re.search(r"(\d+)\+?\s*day", t)
+    if m:
+        return today - timedelta(days=int(m.group(1)))
+    return None
+
+def _parse_posted_ago(text):
+    """Extract a 'posted N days ago' date from freeform job-card context.
+
+    Stricter than _parse_workday_posted_on: the digit must be preceded by
+    'posted' within the same phrase so that unrelated text such as
+    '45 day probation period' or '2 business days response time' does NOT
+    produce a false date that would cause valid new jobs to be discarded.
+    """
+    if not text:
+        return None
+    t = text.lower()
+    today = datetime.today().date()
+    # "posted today" / "posted: today"
+    if re.search(r"posted\b.{0,20}\btoday\b", t):
+        return today
+    # "posted yesterday"
+    if re.search(r"posted\b.{0,20}\byesterday\b", t):
+        return today - timedelta(days=1)
+    # "posted 6 days ago", "posted 30+ days ago"
+    m = re.search(r"posted\b.{0,20}?(\d+)\+?\s*days?\s+ago", t)
     if m:
         return today - timedelta(days=int(m.group(1)))
     return None
@@ -542,6 +571,37 @@ def fetch_recruitee_jobs(url):
         })
     return jobs
 
+def fetch_personio_jobs(url):
+    """Fetch jobs from Personio ATS via its public JSON API."""
+    parsed    = urlparse(url)
+    subdomain = parsed.netloc.split(".")[0]
+    api_url   = f"https://{parsed.netloc}/api/jobs"
+    try:
+        resp = requests.get(api_url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("  ⚠  Personio API error (%s): %s", url, exc)
+        return None
+    jobs = []
+    for job in data:
+        title    = job.get("name", "") or ""
+        # location may be nested under office or at top level
+        office   = (job.get("office") or {})
+        location = office.get("name", "") or job.get("office", "") or ""
+        if isinstance(location, dict):
+            location = location.get("name", "")
+        job_url  = job.get("url", url)
+        if not is_relevant_role(title):
+            continue
+        if location and not is_relevant_location(location):
+            continue
+        jobs.append({
+            "title": title, "location": location or "See posting", "url": job_url,
+            "posted_date": parse_posted_date(job.get("createdAt", "") or job.get("created_at", "")),
+        })
+    return jobs
+
 def _workday_api_url(url):
     """Parse a Workday career page URL into (api_url, applied_facets)."""
     parsed = urlparse(url)
@@ -601,6 +661,8 @@ ATS_FETCHERS = {
     "lever.co":          fetch_lever_jobs,
     "recruitee.com":     fetch_recruitee_jobs,
     "myworkdayjobs.com": fetch_workday_jobs,
+    "jobs.personio.com": fetch_personio_jobs,
+    "jobs.personio.de":  fetch_personio_jobs,
 }
 
 def detect_ats_fetcher(url):
