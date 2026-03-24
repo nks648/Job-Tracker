@@ -52,6 +52,7 @@ LOCATION_KEYWORDS = [
     "munich", "münchen", "munchen", "taufkirchen", "ottobrunn",
     "garching", "unterschleißheim", "unterschleissheim",
     "oberpfaffenhofen", "dachau", "freising", "starnberg", "germering",
+    "parsdorf",
     "nuremberg", "nürnberg", "nurnberg", "erlangen",
     "fürth", "furth", "schwabach", "herzogenaurach",
     "remote", "hybrid", "germany", "deutschland", "bavaria", "bayern",
@@ -423,9 +424,10 @@ def send_email(results, db_updated):
 _DATE_FMTS = (
     "%d-%b-%Y",                  # 16-Mar-2026
     "%Y-%m-%d",                  # 2026-03-16
-    "%Y-%m-%dT%H:%M:%S.%fZ",    # 2026-03-16T10:30:00.000Z  (UTC)
-    "%Y-%m-%dT%H:%M:%SZ",       # 2026-03-16T10:30:00Z      (UTC)
-    "%Y-%m-%dT%H:%M:%S%z",      # 2026-03-16T10:30:00+01:00 (tz-aware, e.g. Personio)
+    "%Y-%m-%dT%H:%M:%S.%fZ",    # 2026-03-16T10:30:00.000Z     (UTC literal Z)
+    "%Y-%m-%dT%H:%M:%SZ",       # 2026-03-16T10:30:00Z          (UTC literal Z)
+    "%Y-%m-%dT%H:%M:%S.%f%z",   # 2026-03-16T10:30:00.000+0000 (e.g. SmartRecruiters)
+    "%Y-%m-%dT%H:%M:%S%z",      # 2026-03-16T10:30:00+01:00    (e.g. Personio)
 )
 
 def parse_posted_date(raw):
@@ -633,6 +635,101 @@ def fetch_personio_jobs(url):
         })
     return jobs
 
+_SR_COUNTRY_NAMES = {"DE": "Germany", "AT": "Austria", "CH": "Switzerland", "FR": "France"}
+
+def fetch_smartrecruiters_jobs(url):
+    """Fetch jobs from SmartRecruiters ATS via its public API.
+
+    Auto-detects the company identifier from a jobs.smartrecruiters.com link
+    embedded in the page source, then calls the documented public postings API.
+    """
+    html = fetch(url)
+    if not html:
+        return None
+    # The page source always contains at least one canonical SR link of the form
+    # jobs.smartrecruiters.com/{CompanyIdentifier}/...
+    m = re.search(r'jobs\.smartrecruiters\.com/([A-Za-z0-9_-]+)', html)
+    if not m:
+        m = re.search(r'"companyIdentifier"\s*:\s*"([^"]+)"', html)
+    if not m:
+        log.warning("  ⚠  SmartRecruiters: could not detect company identifier (%s)", url)
+        return None
+    company_id = m.group(1)
+    api_base   = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings"
+    jobs, offset = [], 0
+    while True:
+        try:
+            resp = requests.get(api_base, headers=HEADERS,
+                                params={"limit": 100, "offset": offset}, timeout=25)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("  ⚠  SmartRecruiters API error (%s): %s", url, exc)
+            break
+        content = data.get("content", [])
+        total   = data.get("totalFound", 0)
+        for posting in content:
+            title = posting.get("name", "") or ""
+            loc   = posting.get("location") or {}
+            city  = loc.get("city", "") or ""
+            country = _SR_COUNTRY_NAMES.get(loc.get("country", ""), loc.get("country", ""))
+            location = ", ".join(p for p in [city, country] if p)
+            job_url  = posting.get("ref", url)
+            if not is_relevant_role(title):
+                continue
+            if location and not is_relevant_location(location):
+                continue
+            jobs.append({
+                "title": title, "location": location or "See posting", "url": job_url,
+                "posted_date": parse_posted_date(posting.get("releasedDate", "")),
+            })
+        offset += len(content)
+        if offset >= total or not content:
+            break
+    return jobs
+
+def fetch_phenom_jobs(url):
+    """Fetch jobs from Phenom People ATS via its search API.
+
+    Extracts the domain from the URL's `domain=` query param (or falls back to
+    the netloc), then calls the standard Phenom /api/jobs endpoint.
+    """
+    parsed = urlparse(url)
+    qs     = parse_qs(parsed.query)
+    domain = (qs.get("domain") or [None])[0] or parsed.netloc
+    base   = f"{parsed.scheme}://{parsed.netloc}"
+    api_url = f"{base}/api/jobs"
+    jobs, start, rows = [], 0, 50
+    while True:
+        params = {"domain": domain, "query": "project manager",
+                  "location": "Munich, Germany", "rows": rows, "start": start}
+        try:
+            resp = requests.get(api_url, headers=HEADERS, params=params, timeout=25)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("  ⚠  Phenom API error (%s): %s", url, exc)
+            break
+        batch = data.get("jobs", [])
+        total = (data.get("meta") or {}).get("total", 0)
+        for job in batch:
+            title    = job.get("title", "") or ""
+            location = job.get("location", "") or ""
+            job_url  = job.get("applyUrl", "") or job.get("url", "") or url
+            if not is_relevant_role(title):
+                continue
+            if location and not is_relevant_location(location):
+                continue
+            jobs.append({
+                "title": title, "location": location or "See posting", "url": job_url,
+                "posted_date": parse_posted_date(
+                    job.get("datePosted", "") or job.get("postedDate", "")),
+            })
+        start += len(batch)
+        if start >= total or not batch:
+            break
+    return jobs
+
 def _workday_api_url(url):
     """Parse a Workday career page URL into (api_url, applied_facets, base_url)."""
     parsed = urlparse(url)
@@ -688,12 +785,21 @@ def fetch_workday_jobs(url):
     return jobs
 
 ATS_FETCHERS = {
-    "greenhouse.io":     fetch_greenhouse_jobs,
-    "lever.co":          fetch_lever_jobs,
-    "recruitee.com":     fetch_recruitee_jobs,
-    "myworkdayjobs.com": fetch_workday_jobs,
-    "jobs.personio.com": fetch_personio_jobs,
-    "jobs.personio.de":  fetch_personio_jobs,
+    "greenhouse.io":              fetch_greenhouse_jobs,
+    "lever.co":                   fetch_lever_jobs,
+    "recruitee.com":              fetch_recruitee_jobs,
+    "myworkdayjobs.com":          fetch_workday_jobs,
+    "jobs.personio.com":          fetch_personio_jobs,
+    "jobs.personio.de":           fetch_personio_jobs,
+    # SmartRecruiters (custom career domains)
+    "jobs.hensoldt.net":          fetch_smartrecruiters_jobs,
+    "careers.ses.com":            fetch_smartrecruiters_jobs,
+    "jobs.kraussmaffei.com":      fetch_smartrecruiters_jobs,
+    # Phenom People
+    "careers.appliedmaterials.com": fetch_phenom_jobs,
+    "jobs.infineon.com":          fetch_phenom_jobs,
+    "careers.amd.com":            fetch_phenom_jobs,
+    "jobs.linde.com":             fetch_phenom_jobs,
 }
 
 def detect_ats_fetcher(url):
