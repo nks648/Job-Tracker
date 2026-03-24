@@ -451,13 +451,15 @@ def _parse_workday_posted_on(text):
         return None
     t = text.lower()
     today = datetime.today().date()
+    # Check numeric pattern first so "Posted 30+ Days Ago — Closes Today"
+    # resolves to 30 days ago rather than today.
+    m = re.search(r"(\d+)\+?\s*day", t)
+    if m:
+        return today - timedelta(days=int(m.group(1)))
     if "today" in t:
         return today
     if "yesterday" in t:
         return today - timedelta(days=1)
-    m = re.search(r"(\d+)\+?\s*day", t)
-    if m:
-        return today - timedelta(days=int(m.group(1)))
     return None
 
 def _parse_posted_ago(text):
@@ -677,7 +679,8 @@ def fetch_workday_jobs(url):
                 continue
             jobs.append({
                 "title": title, "location": location or "See posting", "url": job_url,
-                "posted_date": _parse_workday_posted_on(posting.get("postedOn", "")),
+                "posted_date": (_parse_workday_posted_on(posting.get("postedOn", ""))
+                               or parse_posted_date(posting.get("postedOn", ""))),
             })
         offset += len(postings)
         if offset >= total or not postings:
