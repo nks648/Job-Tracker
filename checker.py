@@ -210,6 +210,7 @@ def append_page_change_to_db(company, career_url, existing_db):
         writer = csv.DictWriter(f, fieldnames=DB_COLUMNS)
         writer.writerow({
             "Date Recorded": today,
+            "Date Posted":   "",
             "Company":       company,
             "Job Title":     "⚠️ Page changed — check manually",
             "Location":      "Unknown (JS-rendered)",
@@ -265,14 +266,14 @@ def extract_jobs(html, page_url):
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE) as f:
+            with open(STATE_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("⚠  State file unreadable (%s) — starting fresh baseline", exc)
     return {}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 def fetch(url):
@@ -419,7 +420,13 @@ def send_email(results, db_updated):
 
 # ── Posting-date helpers ───────────────────────────────────────────────────────
 
-_DATE_FMTS = ("%d-%b-%Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")
+_DATE_FMTS = (
+    "%d-%b-%Y",                  # 16-Mar-2026
+    "%Y-%m-%d",                  # 2026-03-16
+    "%Y-%m-%dT%H:%M:%S.%fZ",    # 2026-03-16T10:30:00.000Z  (UTC)
+    "%Y-%m-%dT%H:%M:%SZ",       # 2026-03-16T10:30:00Z      (UTC)
+    "%Y-%m-%dT%H:%M:%S%z",      # 2026-03-16T10:30:00+01:00 (tz-aware, e.g. Personio)
+)
 
 def parse_posted_date(raw):
     """Return datetime.date from various date/timestamp strings, or None."""
