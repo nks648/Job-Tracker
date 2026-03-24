@@ -15,13 +15,14 @@ import smtplib
 import csv
 import logging
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urljoin, parse_qs
+from urllib.parse import urlparse, urljoin, parse_qs, quote
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 
@@ -54,6 +55,11 @@ LOCATION_KEYWORDS = [
     "nuremberg", "nürnberg", "nurnberg", "erlangen",
     "fürth", "furth", "schwabach", "herzogenaurach",
     "remote", "hybrid", "germany", "deutschland", "bavaria", "bayern",
+]
+# Compiled once at import time — reused across all calls to extract_location_hint()
+_LOCATION_REGEXES = [
+    re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)[^\n,|•·]{{0,40}}", re.IGNORECASE)
+    for kw in LOCATION_KEYWORDS
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -145,8 +151,7 @@ def is_relevant_location(loc_text):
     return contains_any(loc_text, LOCATION_KEYWORDS)
 
 def extract_location_hint(text):
-    for kw in LOCATION_KEYWORDS:
-        pattern = re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)[^\n,|•·]{{0,40}}", re.IGNORECASE)
+    for pattern in _LOCATION_REGEXES:
         m = pattern.search(text)
         if m:
             return m.group(0).strip()[:60]
@@ -535,7 +540,7 @@ def fetch_lever_jobs(url):
     location_param = qs.get("location", [None])[0]
     api_url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
     if location_param:
-        api_url += f"&location={requests.utils.quote(location_param)}"
+        api_url += f"&location={quote(location_param)}"
     try:
         resp = requests.get(api_url, headers=HEADERS, timeout=25)
         resp.raise_for_status()
@@ -620,7 +625,7 @@ def fetch_personio_jobs(url):
     return jobs
 
 def _workday_api_url(url):
-    """Parse a Workday career page URL into (api_url, applied_facets)."""
+    """Parse a Workday career page URL into (api_url, applied_facets, base_url)."""
     parsed = urlparse(url)
     tenant = parsed.netloc.split(".")[0]
     # Path may have an optional locale prefix like /fr-FR/ or /en-US/
@@ -629,15 +634,14 @@ def _workday_api_url(url):
         path_parts = path_parts[1:]
     board   = path_parts[0] if path_parts else "careers"
     api_url = f"https://{parsed.netloc}/wday/cxs/{tenant}/{board}/jobs"
+    base    = f"{parsed.scheme}://{parsed.netloc}"
     # Preserve location facets already encoded in the URL query string
     facets  = {k: v for k, v in parse_qs(parsed.query).items()}
-    return api_url, facets
+    return api_url, facets, base
 
 def fetch_workday_jobs(url):
     """Fetch jobs from Workday ATS via its internal JSON API."""
-    api_url, facets = _workday_api_url(url)
-    parsed = urlparse(url)
-    base   = f"{parsed.scheme}://{parsed.netloc}"
+    api_url, facets, base = _workday_api_url(url)
     jobs, offset, limit = [], 0, 20
     while True:
         payload = {"appliedFacets": facets, "limit": limit, "offset": offset, "searchText": ""}
@@ -730,14 +734,15 @@ def main():
             # Log page changes with no parseable jobs (JS-rendered)
             if not first_run and changed and not found:
                 append_page_change_to_db(name, url, existing_db)
+            # Enrich with posting dates from detail pages, fetched concurrently
+            to_enrich = [j for j in new_jobs if j.get("posted_date") is None and j["url"] != url]
+            if to_enrich:
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    futures = {pool.submit(fetch_posting_date, j["url"]): j for j in to_enrich}
+                    for fut in as_completed(futures):
+                        futures[fut]["posted_date"] = fut.result()
 
-        # ── Common: enrich with posting date, apply recency filter, save to DB ──
-        # For HTML-scraped companies, fetch the detail page for each new job
-        # to extract the "Posted since" date.
-        if not ats_fetcher:
-            for j in new_jobs:
-                if j.get("posted_date") is None and j["url"] != url:
-                    j["posted_date"] = fetch_posting_date(j["url"])
+        # ── Common: apply recency filter, save to DB ──────────────────────────
 
         recent_jobs = [j for j in new_jobs if is_recent(j)]
         skipped     = len(new_jobs) - len(recent_jobs)
