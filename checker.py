@@ -46,9 +46,7 @@ LOCATION_KEYWORDS = [
     "munich", "münchen", "munchen", "taufkirchen", "ottobrunn",
     "garching", "unterschleißheim", "unterschleissheim",
     "oberpfaffenhofen", "dachau", "freising", "starnberg", "germering",
-    "nuremberg", "nürnberg", "nurnberg", "erlangen",
-    "fürth", "furth", "schwabach", "herzogenaurach",
-    "remote", "hybrid", "germany", "deutschland", "bavaria", "bayern",
+    "bavaria", "bayern", "germany", "deutschland",
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -258,13 +256,9 @@ def page_fingerprint(html):
 def send_email(results, db_updated):
     total_jobs   = sum(len(r["new_jobs"]) for r in results)
     page_changes = sum(1 for r in results if r["page_changed"] and not r["new_jobs"])
-    date_str     = datetime.today().strftime("%d %b %Y")
+    date_str     = datetime.today().strftime("%Y-%m-%d")
 
-    subject = (
-        f"🚨 Job Alert: {total_jobs} new role(s) found"
-        + (f" + {page_changes} page change(s)" if page_changes else "")
-        + f" — {date_str}"
-    )
+    subject = f"Munich Job Alert – {date_str}"
 
     # HTML job rows
     job_rows = ""
@@ -301,18 +295,27 @@ def send_email(results, db_updated):
         "</p>"
     ) if db_updated else ""
 
+    no_results_note = (
+        "<p style='background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;"
+        "padding:16px;font-size:14px;color:#374151;margin:0'>"
+        "No new matching Project Manager / Program Manager roles found in the Munich area today. "
+        "All 35 companies were checked.</p>"
+    ) if not job_rows and not page_rows else ""
+
     html = f"""<html><body style="font-family:'Segoe UI',Arial,sans-serif;color:#111;max-width:720px;margin:auto;padding:24px">
   <div style="background:linear-gradient(135deg,#1d4ed8,#1e40af);border-radius:10px;padding:22px 28px;margin-bottom:28px">
-    <h2 style="color:#fff;margin:0 0 6px">🚨 Job Alert — {date_str}</h2>
+    <h2 style="color:#fff;margin:0 0 6px">Munich Job Alert — {date_str}</h2>
     <p style="color:#bfdbfe;margin:0;font-size:14px">
       <strong style="color:#fff">Roles:</strong> Project Manager · Program Manager (Senior / Mid-level) &nbsp;|&nbsp;
-      <strong style="color:#fff">Areas:</strong> Munich · Nuremberg
+      <strong style="color:#fff">Area:</strong> Munich &amp; surroundings
     </p>
   </div>
 
-  {"<h3 style='color:#1d4ed8;margin:0 0 10px'>✅ " + str(total_jobs) + " New Matching Role(s)</h3><table style='border-collapse:collapse;width:100%'><thead><tr style='border-bottom:2px solid #e5e7eb'><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th><th></th></tr></thead><tbody>" + job_rows + "</tbody></table>" if job_rows else ""}
+  {"<h3 style='color:#1d4ed8;margin:0 0 10px'>New Matching Role(s): " + str(total_jobs) + "</h3><table style='border-collapse:collapse;width:100%'><thead><tr style='border-bottom:2px solid #e5e7eb'><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>COMPANY</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>ROLE</th><th style='text-align:left;padding:8px 14px 8px 0;font-size:13px;color:#6b7280'>LOCATION</th><th></th></tr></thead><tbody>" + job_rows + "</tbody></table>" if job_rows else ""}
 
-  {"<h3 style='color:#f59e0b;margin:28px 0 6px'>⚠️ Pages Changed — Manual Check Needed</h3><p style='color:#6b7280;font-size:13px;margin:0 0 10px'>These pages updated but jobs couldn't be auto-extracted (JS-rendered sites).</p><table style='border-collapse:collapse;width:100%'><tbody>" + page_rows + "</tbody></table>" if page_rows else ""}
+  {no_results_note}
+
+  {"<h3 style='color:#f59e0b;margin:28px 0 6px'>Pages Changed — Manual Check Needed</h3><p style='color:#6b7280;font-size:13px;margin:0 0 10px'>These pages updated but jobs couldn't be auto-extracted (JS-rendered sites).</p><table style='border-collapse:collapse;width:100%'><tbody>" + page_rows + "</tbody></table>" if page_rows else ""}
 
   {db_note}
 
@@ -323,8 +326,10 @@ def send_email(results, db_updated):
 </body></html>"""
 
     # Plain text
-    lines = [f"Job Alert — {date_str}", "=" * 50,
-             "Filters: Project/Program Manager | Senior & Mid | Munich & Nuremberg\n"]
+    lines = [f"Munich Job Alert – {date_str}", "=" * 50,
+             "Filters: Project/Program Manager | Senior & Mid | Munich area\n"]
+    if not job_rows and not page_rows:
+        lines.append("No new matching roles found today. All 35 companies were checked.\n")
     for r in results:
         for j in r["new_jobs"]:
             lines += [f"[{r['company']}] {j['title']}", f"  Location: {j['location']}", f"  {j['url']}", ""]
@@ -431,11 +436,8 @@ def main():
 
     save_state(state)
 
-    if results:
-        log.info("Sending email to %d recipient(s)…", len(NOTIFY_EMAILS))
-        send_email(results, db_updated=bool(new_db_rows))
-    else:
-        log.info("No new matching roles today.")
+    log.info("Sending email to %d recipient(s)…", len(NOTIFY_EMAILS))
+    send_email(results, db_updated=bool(new_db_rows))
 
     log.info("── Done ──")
 
