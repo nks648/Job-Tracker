@@ -1,0 +1,4 @@
+job_state.json
+jobs_database.csv
+__pycache__/
+*.pyc
