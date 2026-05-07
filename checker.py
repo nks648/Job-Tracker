@@ -110,6 +110,7 @@ COMPANIES = [
     {"name": "Munich Re",           "url": "https://www.munichre.com/en/company/careers/job-opportunities.html?location=munich"},
     {"name": "Linde",               "url": "https://jobs.linde.com/en/jobs?country=Germany&city=Pullach"},
     {"name": "MAN Energy Solutions","url": "https://www.man-es.com/company/careers/job-offerings?location=Germany"},
+    {"name": "ARX Robotics",        "url": "https://www.arx-robotics.com/careers"},
 ]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
